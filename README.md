@@ -3,7 +3,9 @@
 **English** | [简体中文](README.zh-CN.md)
 
 <p>
-  <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
+  <a href="https://github.com/brothers7/cangjie-datahub/actions"><img src="https://github.com/brothers7/cangjie-datahub/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+
   <img src="https://img.shields.io/badge/python-3.11+-green.svg" alt="Python">
   <img src="https://img.shields.io/badge/react-18-61dafb.svg" alt="React">
   <img src="https://img.shields.io/badge/docker-compose-2496ED.svg" alt="Docker">
@@ -205,6 +207,8 @@ cd frontend && npx tsc --noEmit && npm run build
 ---
 
 ## 🤝 Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Issues and PRs are welcome! Please read the module guide above and keep the security perimeter intact (see `prd.md` for the full product spec, Chinese).
 

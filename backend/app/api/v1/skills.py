@@ -1,0 +1,105 @@
+"""自定义 Skill 管理 API（PRD 3.3C）：上传/启停/版本/删除。仅管理员可管理，登录可查已启用列表。"""
+from __future__ import annotations
+
+import uuid
+
+from fastapi import APIRouter, Depends, UploadFile
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import get_current_user, require_admin
+from app.core.errors import NotFoundError, ValidationError
+from app.db.models import AuditLog, CustomSkill, SkillStatus, SkillType
+from app.db.session import get_db
+from app.services import custom_skills as cs
+
+router = APIRouter(prefix="/skills", tags=["skills"])
+
+
+def _row(s: CustomSkill) -> dict:
+    return {"id": str(s.id), "name": s.name, "description": s.description,
+            "version": s.version, "skill_type": s.skill_type.value,
+            "trigger_keywords": s.trigger_keywords or [],
+            "status": s.status.value, "created_by": s.created_by_name,
+            "invoke_count": s.invoke_count,
+            "last_invoked_at": s.last_invoked_at.isoformat() if s.last_invoked_at else None,
+            "created_at": s.created_at.isoformat()}
+
+
+@router.get("")
+async def list_skills(all: bool = False, db: AsyncSession = Depends(get_db),
+                      user=Depends(get_current_user)):
+    """普通用户看已启用；管理员带 ?all=1 看全部（含停用/历史版本）。"""
+    q = select(CustomSkill).order_by(CustomSkill.name, CustomSkill.version.desc())
+    if not (all and user.role.value == "admin"):
+        q = q.where(CustomSkill.status == SkillStatus.ENABLED)
+    return [_row(s) for s in (await db.execute(q)).scalars()]
+
+
+@router.post("/upload")
+async def upload(file: UploadFile, db: AsyncSession = Depends(get_db),
+                 user=Depends(require_admin)):
+    """上传 Skill zip 包。同名自动累加版本号；上传后默认停用，需显式启用。"""
+    data = await file.read()
+    pkg = cs.parse_package(data)   # 所有非法情况在此抛 ValidationError
+
+    max_ver = (await db.execute(
+        select(func.max(CustomSkill.version)).where(CustomSkill.name == pkg.name)
+    )).scalar() or 0
+    # 同名已有启用版本：自动停用旧版（同名同时只有一个启用版本）
+    for old in (await db.execute(
+            select(CustomSkill).where(CustomSkill.name == pkg.name,
+                                      CustomSkill.status == SkillStatus.ENABLED))).scalars():
+        old.status = SkillStatus.DISABLED
+
+    skill = CustomSkill(name=pkg.name, description=pkg.description, version=max_ver + 1,
+                        skill_type=SkillType(pkg.skill_type),
+                        trigger_keywords=pkg.trigger_keywords,
+                        files=pkg.files, entry=pkg.entry,
+                        status=SkillStatus.DISABLED,
+                        created_by=user.id, created_by_name=user.username)
+    db.add(skill)
+    await db.flush()
+    db.add(AuditLog(user_id=user.id, username=user.username, action="skill.upload",
+                    resource_type="custom_skill", resource_id=str(skill.id),
+                    detail={"name": pkg.name, "version": skill.version,
+                            "type": pkg.skill_type, "files": sorted(pkg.files)}))
+    await db.commit()
+    return _row(skill)
+
+
+@router.post("/{skill_id}/status")
+async def set_status(skill_id: str, body: dict, db: AsyncSession = Depends(get_db),
+                     user=Depends(require_admin)):
+    """启用/停用。body: {"status": "enabled"|"disabled"}。启用时自动停用同名其它版本。"""
+    s = await db.get(CustomSkill, uuid.UUID(skill_id))
+    if s is None:
+        raise NotFoundError("Skill 不存在")
+    target = (body or {}).get("status")
+    if target not in ("enabled", "disabled"):
+        raise ValidationError("status 必须是 enabled 或 disabled")
+    if target == "enabled":
+        for other in (await db.execute(
+                select(CustomSkill).where(CustomSkill.name == s.name,
+                                          CustomSkill.id != s.id))).scalars():
+            other.status = SkillStatus.DISABLED
+    s.status = SkillStatus(target)
+    db.add(AuditLog(user_id=user.id, username=user.username,
+                    action=f"skill.{target}", resource_type="custom_skill",
+                    resource_id=str(s.id), detail={"name": s.name, "version": s.version}))
+    await db.commit()
+    return _row(s)
+
+
+@router.delete("/{skill_id}")
+async def delete_skill(skill_id: str, db: AsyncSession = Depends(get_db),
+                       user=Depends(require_admin)):
+    s = await db.get(CustomSkill, uuid.UUID(skill_id))
+    if s is None:
+        raise NotFoundError("Skill 不存在")
+    await db.delete(s)
+    db.add(AuditLog(user_id=user.id, username=user.username, action="skill.delete",
+                    resource_type="custom_skill", resource_id=str(s.id),
+                    detail={"name": s.name, "version": s.version}))
+    await db.commit()
+    return {"ok": True}

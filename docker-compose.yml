@@ -1,0 +1,68 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: da_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-data_agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-data_agent_pg_pw}
+      POSTGRES_DB: ${POSTGRES_DB:-data_agent}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-data_agent} -d ${POSTGRES_DB:-data_agent}"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    networks: [data_agent_net]
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: da_qdrant
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks: [data_agent_net]
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    container_name: da_backend
+    env_file: .env
+    environment:
+      APP_DB_URL: postgresql+asyncpg://${POSTGRES_USER:-data_agent}:${POSTGRES_PASSWORD:-data_agent_pg_pw}@postgres:5432/${POSTGRES_DB:-data_agent}
+      QDRANT_URL: http://qdrant:6333
+      DEMO_DB_PATH: /app/demo_data/ecom_demo.db
+    ports:
+      - "${BACKEND_PORT:-9000}:9000"
+    volumes:
+      - demo_data:/app/demo_data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    networks: [data_agent_net]
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    container_name: da_frontend
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    depends_on:
+      - backend
+    networks: [data_agent_net]
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+  qdrant_data:
+  demo_data:
+
+networks:
+  data_agent_net:
+    driver: bridge

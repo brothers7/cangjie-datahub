@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/node_modules/
+
+# Local data
+local/
+*.db
+*.sqlite3
+
+# Env & secrets
+.env
+demo_data/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Claude Code 本地状态
+.claude/

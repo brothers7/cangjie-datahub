@@ -159,7 +159,7 @@ encrypted credentials · login lockout · LIKE-wildcard escaping · full audit.
 ### Docker (recommended)
 
 ```bash
-git clone https://github.com/<your-org>/cangjie-datahub.git
+git clone https://github.com/brothers7/cangjie-datahub.git
 cd cangjie-datahub
 make up          # first run copies .env.example → .env; CHANGE THE SECRETS inside
 ```

@@ -158,7 +158,7 @@ Skill 沙箱（禁网/禁盘）· DDL 绝不自动执行 · 调度写双重人�
 ### Docker（推荐）
 
 ```bash
-git clone https://github.com/<your-org>/cangjie-datahub.git
+git clone https://github.com/brothers7/cangjie-datahub.git
 cd cangjie-datahub
 make up          # 首次运行会从 .env.example 复制 .env；务必修改其中的密钥
 ```

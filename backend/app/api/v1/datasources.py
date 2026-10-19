@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import timedelta
 
 from fastapi import APIRouter, Depends, BackgroundTasks
 from sqlalchemy import select
@@ -11,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import accessible_datasource_ids, get_current_user, require_admin
 from app.connectors.registry import get_connector
 from app.core.crypto import decrypt, encrypt
-from app.core.errors import DatasourceError, NotFoundError, PermissionDenied, ValidationError
+from app.core.errors import AppError, DatasourceError, NotFoundError, PermissionDenied, ValidationError
 from app.db.models import (AuditLog, DataSource, DsStatus, DbType, MaskStrategy, MaskingRule,
                            MetaColumn, MetaTable, ScanJob, ScanJobStatus, ScanMode, SourceKind)
 from app.db.models.base import utcnow
@@ -22,6 +23,16 @@ from app.schemas.entities import DatasourceIn, DatasourceOut, DatasourceUpdateIn
 router = APIRouter(prefix="/datasources", tags=["datasources"])
 
 VALID_TYPES = {t.value for t in DbType}
+
+# 同一数据源的扫描互斥（进程内）。选择「冲突即拒」而非排队：扫描是分钟级重活，
+# 排队语义对前端不友好；调用方收到 409 后可稍候重试。
+# 注意：定时扫描（jobs.scheduler）也会落 RUNNING 状态的 ScanJob 行，下方触发前的
+# RUNNING 检查同样能挡住与进行中定时扫描的冲突；定时任务自身由调度器
+# max_instances=1 保证不并发。
+_scan_locks: dict[str, asyncio.Lock] = {}
+# 进行中的 RUNNING 任务超过该时长视为悬挂（进程崩溃遗留），不再阻塞新触发；
+# 启动时由 bootstrap.reap_stale_scan_jobs 回收标记 FAILED
+_SCAN_RUNNING_STALE_MINUTES = 30
 
 
 async def _refresh_scan_jobs() -> None:
@@ -163,27 +174,52 @@ async def trigger_scan(ds_id: str, body: dict, background: BackgroundTasks,
     ds = await db.get(DataSource, uuid.UUID(ds_id))
     if ds is None:
         raise NotFoundError("数据源不存在")
-    job = ScanJob(datasource_id=ds.id, mode=mode, triggered_by=f"user:{user.id}",
-                  status=ScanJobStatus.RUNNING, started_at=utcnow())
-    db.add(job)
-    await db.flush()
-    job_id = str(job.id)
-    await db.commit()
+
+    # 互斥检查 1：进程内锁（手动触发之间；锁由后台扫描任务持有到扫描结束）
+    lock = _scan_locks.setdefault(str(ds.id), asyncio.Lock())
+    if lock.locked():
+        raise AppError("该数据源正在扫描中，请稍候再试",
+                       code="SCAN_IN_PROGRESS", http_status=409)
+    # 互斥检查 2：进行中的 RUNNING 任务（覆盖定时扫描 / 其他触发途径）；
+    # 超过悬挂阈值的 RUNNING 视为崩溃遗留，不阻塞新触发
+    stale_before = utcnow() - timedelta(minutes=_SCAN_RUNNING_STALE_MINUTES)
+    running = (await db.execute(select(ScanJob).where(
+        ScanJob.datasource_id == ds.id, ScanJob.status == ScanJobStatus.RUNNING,
+        ScanJob.started_at.isnot(None), ScanJob.started_at >= stale_before
+    ))).scalars().first()
+    if running is not None:
+        raise AppError("该数据源正在扫描中，请稍候再试",
+                       code="SCAN_IN_PROGRESS", http_status=409)
+
+    await lock.acquire()
+    try:
+        job = ScanJob(datasource_id=ds.id, mode=mode, triggered_by=f"user:{user.id}",
+                      status=ScanJobStatus.RUNNING, started_at=utcnow())
+        db.add(job)
+        await db.flush()
+        job_id = str(job.id)
+        await db.commit()
+    except Exception:
+        lock.release()
+        raise
 
     async def _run():
-        async with get_session_factory()() as session:
-            ds2 = await session.get(DataSource, uuid.UUID(ds_id))
-            job2 = await session.get(ScanJob, uuid.UUID(job_id))
-            if ds2 is None or job2 is None:
-                return   # 并发删除：直接退出，不再触碰 None
-            try:
-                await scan_datasource(session, ds2, mode, job2)
-                await session.commit()
-            except Exception as e:
-                job2.status = ScanJobStatus.FAILED
-                job2.error_log = [str(e)[:500]]
-                job2.finished_at = utcnow()
-                await session.commit()
+        try:
+            async with get_session_factory()() as session:
+                ds2 = await session.get(DataSource, uuid.UUID(ds_id))
+                job2 = await session.get(ScanJob, uuid.UUID(job_id))
+                if ds2 is None or job2 is None:
+                    return   # 并发删除：直接退出，不再触碰 None
+                try:
+                    await scan_datasource(session, ds2, mode, job2)
+                    await session.commit()
+                except Exception as e:
+                    job2.status = ScanJobStatus.FAILED
+                    job2.error_log = [str(e)[:500]]
+                    job2.finished_at = utcnow()
+                    await session.commit()
+        finally:
+            lock.release()
 
     background.add_task(_run)
     return {"scan_job_id": job_id}

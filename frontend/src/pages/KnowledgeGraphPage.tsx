@@ -1,5 +1,5 @@
 /** 知识图谱：可视化 / 指标维度编辑 / 合并废弃 / 约束规则 / 指标-维度组合 / 质量校验。 */
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, ApiError } from '@/api/client'
 import { GraphCanvas } from '@/components/kg/GraphCanvas'
 import {
@@ -43,11 +43,20 @@ export default function KnowledgeGraphPage() {
   const [createRule, setCreateRule] = useState(false)
   const [editRule, setEditRule] = useState<KgRule | null>(null)
   const [confirmDel, setConfirmDel] = useState<{ kind: 'metric' | 'dimension'; id: string; name: string } | null>(null)
+  const [delRule, setDelRule] = useState<KgRule | null>(null)
   const [mergeFrom, setMergeFrom] = useState<Metric | null>(null)
+  // 大表格：表内过滤 + 分批渲染
+  const [metricSearch, setMetricSearch] = useState('')
+  const [dimSearch, setDimSearch] = useState('')
+  const [metricLimit, setMetricLimit] = useState(100)
+  const [dimLimit, setDimLimit] = useState(100)
 
   useEffect(() => { void loadDatasources().catch(() => undefined) }, [loadDatasources])
 
+  // 请求序号：dsId 快速切换时丢弃旧响应，避免旧数据覆盖新数据
+  const refreshSeq = useRef(0)
   const refresh = useCallback(async () => {
+    const seq = ++refreshSeq.current
     setLoading(true)
     try {
       const [g, m, d] = await Promise.all([
@@ -55,13 +64,14 @@ export default function KnowledgeGraphPage() {
         api.listMetrics({ datasource_id: dsId || undefined }),
         api.listDimensions(),
       ])
+      if (seq !== refreshSeq.current) return // 已有更新的请求发出，放弃本次结果
       setGraph(g)
       setMetrics(m)
       setDims(d)
     } catch (e) {
-      toast.error((e as ApiError).message)
+      if (seq === refreshSeq.current) toast.error((e as ApiError).message)
     } finally {
-      setLoading(false)
+      if (seq === refreshSeq.current) setLoading(false)
     }
   }, [dsId])
 
@@ -84,6 +94,20 @@ export default function KnowledgeGraphPage() {
         || (d.description || '').toLowerCase().includes(q)) : dims,
     }
   }, [metrics, dims, search])
+
+  // 表内二次过滤（名称/定义），在全局搜索基础上再收窄
+  const metricRows = useMemo(() => {
+    const q = metricSearch.trim().toLowerCase()
+    if (!q) return filtered.metrics
+    return filtered.metrics.filter((m) => m.name.toLowerCase().includes(q)
+      || (m.business_def || '').toLowerCase().includes(q))
+  }, [filtered.metrics, metricSearch])
+  const dimRows = useMemo(() => {
+    const q = dimSearch.trim().toLowerCase()
+    if (!q) return filtered.dims
+    return filtered.dims.filter((d) => d.name.toLowerCase().includes(q)
+      || (d.description || '').toLowerCase().includes(q))
+  }, [filtered.dims, dimSearch])
 
   const toggleType = (t: string) => {
     setTypes((prev) => {
@@ -125,6 +149,9 @@ export default function KnowledgeGraphPage() {
           <div className="card" style={{ overflow: 'hidden', minHeight: 480 }}>
             <div className="card-head">
               <h2>{t('kg.entityGraph')}</h2>
+              {graph.nodes.length >= 500 && (
+                <span className="tiny muted">{t('kg.graphLimitNote')}</span>
+              )}
               <span className="spacer" />
               {(['metric', 'dimension', 'table'] as const).map((ty) => (
                 <label key={ty} className="row tiny" style={{ gap: 4, cursor: 'pointer' }}>
@@ -153,6 +180,10 @@ export default function KnowledgeGraphPage() {
 
       {!loading && tab === 'metrics' && (
         <div className="card" style={{ overflow: 'auto' }}>
+          <div className="row" style={{ padding: '10px 12px 0' }}>
+            <input className="input" style={{ width: 240 }} placeholder={t('kg.tableFilterPlaceholder')}
+              value={metricSearch} onChange={(e) => { setMetricSearch(e.target.value); setMetricLimit(100) }} />
+          </div>
           <table className="table">
             <thead>
               <tr>
@@ -161,7 +192,7 @@ export default function KnowledgeGraphPage() {
               </tr>
             </thead>
             <tbody>
-              {filtered.metrics.map((m) => (
+              {metricRows.slice(0, metricLimit).map((m) => (
                 <tr key={m.id}>
                   <td style={{ fontWeight: 550 }}>
                     {m.name}
@@ -188,12 +219,23 @@ export default function KnowledgeGraphPage() {
               ))}
             </tbody>
           </table>
-          {!filtered.metrics.length && <Empty text={t('kg.noMetrics')} icon="🔍" />}
+          {metricRows.length > metricLimit && (
+            <div className="center" style={{ padding: 10 }}>
+              <button className="btn sm" onClick={() => setMetricLimit((n) => n + 100)}>
+                {t('kg.showMore', { n: metricRows.length - metricLimit })}
+              </button>
+            </div>
+          )}
+          {!metricRows.length && <Empty text={t('kg.noMetrics')} icon="🔍" />}
         </div>
       )}
 
       {!loading && tab === 'dimensions' && (
         <div className="card" style={{ overflow: 'auto' }}>
+          <div className="row" style={{ padding: '10px 12px 0' }}>
+            <input className="input" style={{ width: 240 }} placeholder={t('kg.tableFilterPlaceholder')}
+              value={dimSearch} onChange={(e) => { setDimSearch(e.target.value); setDimLimit(100) }} />
+          </div>
           <table className="table">
             <thead>
               <tr>
@@ -202,7 +244,7 @@ export default function KnowledgeGraphPage() {
               </tr>
             </thead>
             <tbody>
-              {filtered.dims.map((d) => (
+              {dimRows.slice(0, dimLimit).map((d) => (
                 <tr key={d.id}>
                   <td style={{ fontWeight: 550 }}>{d.name}</td>
                   <td><span className="tag">{d.dimension_type}</span></td>
@@ -223,7 +265,14 @@ export default function KnowledgeGraphPage() {
               ))}
             </tbody>
           </table>
-          {!filtered.dims.length && <Empty text={t('kg.noDims')} icon="🔍" />}
+          {dimRows.length > dimLimit && (
+            <div className="center" style={{ padding: 10 }}>
+              <button className="btn sm" onClick={() => setDimLimit((n) => n + 100)}>
+                {t('kg.showMore', { n: dimRows.length - dimLimit })}
+              </button>
+            </div>
+          )}
+          {!dimRows.length && <Empty text={t('kg.noDims')} icon="🔍" />}
         </div>
       )}
 
@@ -260,14 +309,7 @@ export default function KnowledgeGraphPage() {
                     <td>
                       <div className="row" style={{ gap: 4 }}>
                         <button className="btn sm" onClick={() => setEditRule(r)}>{t('common.edit')}</button>
-                        <button className="btn sm danger" onClick={async () => {
-                          if (!window.confirm(t('kg.confirmDeleteRule'))) return
-                          try {
-                            await api.deleteRule(r.id)
-                            setRules((prev) => prev.filter((x) => x.id !== r.id))
-                            toast.ok(t('kg.ruleDeleted'))
-                          } catch (e) { toast.error((e as ApiError).message) }
-                        }}>{t('common.delete')}</button>
+                        <button className="btn sm danger" onClick={() => setDelRule(r)}>{t('common.delete')}</button>
                       </div>
                     </td>
                   </tr>
@@ -331,6 +373,20 @@ export default function KnowledgeGraphPage() {
       {mergeFrom && (
         <MergeModal from={mergeFrom} metrics={metrics} onClose={() => setMergeFrom(null)}
           onDone={() => { setMergeFrom(null); void refresh() }} />
+      )}
+      {delRule && (
+        <Confirm title={t('common.delete')} danger okText={t('common.delete')}
+          text={t('kg.confirmDeleteRule')}
+          onCancel={() => setDelRule(null)}
+          onOk={async () => {
+            const r = delRule
+            setDelRule(null)
+            try {
+              await api.deleteRule(r.id)
+              setRules((prev) => prev.filter((x) => x.id !== r.id))
+              toast.ok(t('kg.ruleDeleted'))
+            } catch (e) { toast.error((e as ApiError).message) }
+          }} />
       )}
       {confirmDel && (
         <Confirm title={confirmDel.kind === 'metric' ? t('kg.deprecateMetric') : t('kg.deprecateDimension')} danger okText={t('kg.deprecate')}
@@ -528,8 +584,27 @@ function MetricEditor({ metric, onClose, onSaved }: {
     max: metric.value_range?.[1]?.toString() ?? '',
   })
   const [busy, setBusy] = useState(false)
+  const [rangeErr, setRangeErr] = useState('')
 
   const save = async () => {
+    // 值域校验：任一填写则两者都必须是有效数字，且 min < max，否则不提交
+    const minRaw = f.min.trim()
+    const maxRaw = f.max.trim()
+    let valueRange: [number, number] | undefined
+    if (minRaw !== '' || maxRaw !== '') {
+      const min = Number(minRaw)
+      const max = Number(maxRaw)
+      if (!Number.isFinite(min) || !Number.isFinite(max)) {
+        setRangeErr(t('kg.rangeInvalid'))
+        return
+      }
+      if (min >= max) {
+        setRangeErr(t('kg.rangeOrder'))
+        return
+      }
+      valueRange = [min, max]
+    }
+    setRangeErr('')
     setBusy(true)
     try {
       const payload: Record<string, unknown> = {
@@ -542,7 +617,7 @@ function MetricEditor({ metric, onClose, onSaved }: {
         period_grain: f.period_grain || null,
         business_domain: f.business_domain,
       }
-      if (f.min !== '' && f.max !== '') payload.value_range = [Number(f.min), Number(f.max)]
+      if (valueRange) payload.value_range = valueRange
       await api.updateMetric(metric.id, payload)
       toast.ok(t('kg.metricSaved'))
       onSaved()
@@ -598,6 +673,7 @@ function MetricEditor({ metric, onClose, onSaved }: {
           </Field>
           <Field label={t('kg.rangeMax')}>
             <input className="input" value={f.max} onChange={(e) => setF({ ...f, max: e.target.value })} />
+            {rangeErr && <span className="hint" style={{ color: '#cf3f3f' }}>{rangeErr}</span>}
           </Field>
         </div>
         <Field label={t('kg.defLabel')} hint={t('kg.defHint')}>

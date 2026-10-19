@@ -43,6 +43,17 @@ export function GraphCanvas({ graph, selectedId, onSelect, types }: {
   const visibleIds = new Set(visibleNodes.map((n) => n.id))
   const visibleEdges = graph.edges.filter((e) => visibleIds.has(e.src) && visibleIds.has(e.dst))
 
+  // 主循环（物理/绘制）只挂载一次，draw 闭包需要的最新状态经 ref 读取，
+  // 避免 hover/选中/过滤变化时 cancelAnimationFrame + 断开 ResizeObserver 重建整个循环
+  const hoverRef = useRef<string | null>(null)
+  const selectedIdRef = useRef<string | null>(selectedId || null)
+  const visibleEdgesRef = useRef(visibleEdges)
+  const tRef = useRef(t)
+  hoverRef.current = hover
+  selectedIdRef.current = selectedId || null
+  visibleEdgesRef.current = visibleEdges
+  tRef.current = t
+
   // 初始化/增量同步坐标
   useEffect(() => {
     const pts = state.current.points
@@ -104,7 +115,7 @@ export function GraphCanvas({ graph, selectedId, onSelect, types }: {
       // 弹簧
       const spring = 0.035 * alpha
       const restLen = 105
-      for (const e of visibleEdges) {
+      for (const e of visibleEdgesRef.current) {
         const a = points.get(e.src), b = points.get(e.dst)
         if (!a || !b) continue
         const dx = b.x - a.x, dy = b.y - a.y
@@ -128,6 +139,11 @@ export function GraphCanvas({ graph, selectedId, onSelect, types }: {
     const draw = () => {
       const ctx = canvas.getContext('2d')
       if (!ctx) return
+      // 从 ref 取最新状态，保证主循环只挂载一次
+      const hover = hoverRef.current
+      const selectedId = selectedIdRef.current
+      const t = tRef.current
+      const visibleEdges = visibleEdgesRef.current
       const cs = getComputedStyle(document.documentElement)
       const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches
       const textColor = isDark ? '#e7eaee' : '#1c1f24'
@@ -219,7 +235,23 @@ export function GraphCanvas({ graph, selectedId, onSelect, types }: {
       cancelAnimationFrame(state.current.raf)
       ro.disconnect()
     }
-  }, [visibleEdges, visibleNodes, hover, selectedId, t])
+    // 主循环只挂载一次；hover/selectedId/visibleEdges/t 均经 ref 读取
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // React 的 onWheel 会注册为 passive 监听，preventDefault 无效（页面会跟着滚动），
+  // 需手动绑定非 passive 的 wheel 监听
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const st = state.current
+      st.transform.k = Math.max(0.25, Math.min(3, st.transform.k * (e.deltaY < 0 ? 1.12 : 0.89)))
+    }
+    canvas.addEventListener('wheel', onWheel, { passive: false })
+    return () => canvas.removeEventListener('wheel', onWheel)
+  }, [])
 
   // ---- 交互 ----
   const toWorld = (clientX: number, clientY: number) => {
@@ -276,7 +308,7 @@ export function GraphCanvas({ graph, selectedId, onSelect, types }: {
     if (id !== hover) setHover(id)
   }
 
-  const onUp = () => {
+  const onUp = (e: React.MouseEvent) => {
     const st = state.current
     if (st.drag) {
       const p = st.points.get(st.drag.id)
@@ -285,25 +317,18 @@ export function GraphCanvas({ graph, selectedId, onSelect, types }: {
       if (hit) onSelect(hit.node)
       st.drag = null
     }
-    if (st.pan && Math.abs(st.pan.x) && st.pan.tx === st.transform.x && st.pan.ty === st.transform.y) {
-      // 点击空白 → 取消选择
-      onSelect(null)
+    if (st.pan) {
+      // 按下/抬起位移小于阈值才算点击空白 → 取消选择；否则视为拖拽平移
+      const moved = Math.hypot(e.clientX - st.pan.x, e.clientY - st.pan.y)
+      if (moved < 4) onSelect(null)
     }
     st.pan = null
-  }
-
-  const onWheel = (e: React.WheelEvent) => {
-    e.preventDefault()
-    const st = state.current
-    const k = Math.max(0.25, Math.min(3, st.transform.k * (e.deltaY < 0 ? 1.12 : 0.89)))
-    st.transform.k = k
   }
 
   return (
     <div className="kg-canvas" ref={wrapRef}>
       <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: '100%', cursor: hover ? 'pointer' : 'grab' }}
-        onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
-        onWheel={onWheel} />
+        onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp} />
       <div className="kg-legend">
         <span><i style={{ background: NODE_COLORS.metric }} />{t('kg.metric')} {graph.nodes.filter((n) => n.type === 'metric').length}</span>
         <span><i style={{ background: NODE_COLORS.dimension }} />{t('kg.dimension')} {graph.nodes.filter((n) => n.type === 'dimension').length}</span>

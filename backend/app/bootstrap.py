@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import logging
 import uuid
+from datetime import timedelta
 
 from sqlalchemy import select
 
@@ -16,12 +17,50 @@ from app.core.config import settings
 from app.core.security import hash_password
 from app.db.models import Base, DataSource, DsStatus, DbType, Role, ScanJob, ScanJobStatus, ScanMode, User
 from app.db.models.base import utcnow
-from app.db.session import dispose_engine, get_engine, get_session_factory
+from app.db.session import get_engine, get_session_factory
 from app.kg.validator import ensure_default_rules
 
 logger = logging.getLogger("bootstrap")
 
 DEMO_DS_NAME = "演示电商库(SQLite)"
+
+# 悬挂扫描任务阈值：RUNNING 且 started_at 超过该时长视为进程崩溃遗留
+STALE_SCAN_JOB_MINUTES = 30
+
+
+async def reap_stale_scan_jobs(session) -> int:
+    """回收悬挂扫描任务：把 RUNNING 且 started_at 超过阈值的 ScanJob 标记 FAILED。
+
+    进程崩溃/重启会遗留永远 RUNNING 的扫描任务（既误导用户，也会阻塞手动触发
+    的互斥检查）。应用启动时调用一次。
+    """
+    threshold = utcnow() - timedelta(minutes=STALE_SCAN_JOB_MINUTES)
+    rows = (await session.execute(select(ScanJob).where(
+        ScanJob.status == ScanJobStatus.RUNNING,
+        ScanJob.started_at.isnot(None),
+        ScanJob.started_at < threshold))).scalars().all()
+    for j in rows:
+        j.status = ScanJobStatus.FAILED
+        j.finished_at = utcnow()
+        j.error_log = (j.error_log or []) + [
+            f"进程重启回收：任务 RUNNING 超过 {STALE_SCAN_JOB_MINUTES} 分钟，标记失败"]
+    if rows:
+        logger.info("reaped %d stale scan jobs", len(rows))
+    return len(rows)
+
+
+async def dispose_app_engine() -> None:
+    """真正关闭应用库引擎连接池。
+
+    db.session.dispose_engine() 只把全局引用置 None，底层 AsyncEngine 的连接池
+    不会释放；先 await engine.dispose() 再清引用，保证后续 get_engine() 重建的
+    是全新引擎，不残留双引擎。
+    """
+    import app.db.session as db_session
+    eng = db_session._engine
+    if eng is not None:
+        await eng.dispose()
+    db_session.dispose_engine()
 
 
 async def _migrate_columns() -> None:
@@ -139,7 +178,16 @@ async def bootstrap(reseed_demo: bool = False) -> None:
     except Exception as e:
         logger.debug("metric vector index skipped: %s", e)
 
-    dispose_engine()
+    # 6. 回收悬挂扫描任务（上次进程崩溃遗留的 RUNNING 任务）
+    try:
+        async with get_session_factory()() as session:
+            await reap_stale_scan_jobs(session)
+            await session.commit()
+    except Exception as e:
+        logger.debug("reap stale scan jobs skipped: %s", e)
+
+    # 7. 释放引导期引擎（真正关闭连接池，不只清全局引用）
+    await dispose_app_engine()
     logger.info("bootstrap done")
 
 

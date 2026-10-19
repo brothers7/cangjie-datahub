@@ -22,6 +22,10 @@ def _require(module: str, hint: str) -> None:
 class MySQLConnector(Connector):
     db_type = DbType.MYSQL
 
+    def _quote_ident(self, name: str) -> str:
+        # MySQL 默认 sql_mode 下双引号是字符串常量，标识符必须用反引号
+        return "`" + name.replace("`", "``") + "`"
+
     def build_url(self) -> str:
         _require("pymysql", _DRIVER_HINTS[DbType.MYSQL])
         from app.connectors.base import _quote
@@ -81,6 +85,10 @@ class _MySQLProtocolConnector(Connector):
     """Doris / StarRocks 兼容 MySQL 协议，复用 pymysql 驱动。
     两者都不支持事务级只读模式，但支持会话级执行超时。
     """
+
+    def _quote_ident(self, name: str) -> str:
+        # Doris / StarRocks 同 MySQL：默认 sql_mode 下双引号是字符串常量
+        return "`" + name.replace("`", "``") + "`"
 
     def build_url(self) -> str:
         _require("pymysql", _DRIVER_HINTS[DbType.MYSQL])

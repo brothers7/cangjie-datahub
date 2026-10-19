@@ -1,7 +1,7 @@
 /** 数仓规范管理（PRD 3.3E）：规范文档 + 结构化规则开关，管理员维护，全员可见；支持导入 Markdown/TXT 规范文件（启发式建议校验开关）。 */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, ApiError } from '@/api/client'
-import { Empty, Spinner } from '@/components/common/ui'
+import { Confirm, Empty, Spinner } from '@/components/common/ui'
 import { toast } from '@/stores/app'
 import { useAuth } from '@/stores/auth'
 import { useI18n } from '@/i18n'
@@ -20,6 +20,7 @@ export function StandardsPanel() {
   const [draft, setDraft] = useState<Draft>(EMPTY)
   const [preview, setPreview] = useState<DwStandardRow | null>(null)
   const [importing, setImporting] = useState(false)
+  const [deleting, setDeleting] = useState<DwStandardRow | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
   const load = useCallback(async () => {
@@ -69,7 +70,7 @@ export function StandardsPanel() {
   }
 
   const remove = async (s: DwStandardRow) => {
-    if (!window.confirm(t('modeling.confirmDeleteStandard', { name: s.name }))) return
+    setDeleting(null)
     try {
       await api.deleteStandard(s.id)
       toast.ok(t('common.deleted'))
@@ -126,7 +127,7 @@ export function StandardsPanel() {
                 <span className="spacer" />
                 {isAdmin && <>
                   <button className="btn sm" onClick={() => startEdit(preview)}>{t('common.edit')}</button>
-                  <button className="btn ghost sm" onClick={() => void remove(preview)}>{t('common.delete')}</button>
+                  <button className="btn ghost sm" onClick={() => setDeleting(preview)}>{t('common.delete')}</button>
                 </>}
               </div>
               {preview.rules.length > 0 && (
@@ -185,6 +186,16 @@ export function StandardsPanel() {
           )}
         </div>
       </div>
+      {deleting && (
+        <Confirm
+          danger
+          title={t('common.delete')}
+          text={t('modeling.confirmDeleteStandard', { name: deleting.name })}
+          okText={t('common.delete')}
+          onCancel={() => setDeleting(null)}
+          onOk={() => void remove(deleting)}
+        />
+      )}
     </div>
   )
 }

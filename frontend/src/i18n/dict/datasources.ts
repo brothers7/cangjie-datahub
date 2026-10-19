@@ -79,6 +79,10 @@ export default {
     'ds.modeInc': 'Incremental',
     'ds.manual': 'Manual',
     'ds.scanWarnings': 'Scan Warnings',
+    'ds.searchTablePh': 'Search table name…',
+    'ds.showMore': 'Show more ({n} remaining)',
+    'ds.errHostRequired': 'Host is required',
+    'ds.errPortRange': 'Port must be an integer between 1 and 65535',
   },
   zh: {
     'ds.title': '数据源管理',
@@ -159,5 +163,9 @@ export default {
     'ds.modeInc': '增量',
     'ds.manual': '手动',
     'ds.scanWarnings': '扫描告警',
+    'ds.searchTablePh': '搜索表名…',
+    'ds.showMore': '显示更多（还有 {n} 张）',
+    'ds.errHostRequired': '主机地址不能为空',
+    'ds.errPortRange': '端口需为 1-65535 的整数',
   },
 } as { en: Record<string, string>; zh: Record<string, string> }

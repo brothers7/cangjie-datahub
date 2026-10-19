@@ -8,7 +8,7 @@ import { useAuth } from '@/stores/auth'
 export default function LoginPage() {
   const { t } = useI18n()
   const login = useAuth((s) => s.login)
-  const [username, setUsername] = useState('admin')
+  const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')

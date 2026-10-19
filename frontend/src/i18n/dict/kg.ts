@@ -140,6 +140,11 @@ export default {
     'kg.edge.TABLE_JOIN': 'Table Join',
     'kg.edge.METRIC_PARENT': 'Metric Hierarchy',
     'kg.canvasHint': 'Scroll to zoom · Drag nodes/canvas',
+    'kg.graphLimitNote': 'Too many nodes — showing the first 500 only',
+    'kg.tableFilterPlaceholder': 'Filter by name/definition…',
+    'kg.showMore': 'Show more ({n} remaining)',
+    'kg.rangeInvalid': 'Range min/max must both be valid numbers',
+    'kg.rangeOrder': 'Range min must be less than max',
   },
   zh: {
     'kg.title': '知识图谱',
@@ -281,5 +286,10 @@ export default {
     'kg.edge.TABLE_JOIN': '表关联',
     'kg.edge.METRIC_PARENT': '指标层级',
     'kg.canvasHint': '滚轮缩放 · 拖拽节点/画布',
+    'kg.graphLimitNote': '节点较多，仅展示前 500 个节点',
+    'kg.tableFilterPlaceholder': '按名称/口径过滤…',
+    'kg.showMore': '显示更多（剩余 {n} 条）',
+    'kg.rangeInvalid': '值域上下限必须都是有效数字',
+    'kg.rangeOrder': '值域下限必须小于上限',
   },
 } as { en: Record<string, string>; zh: Record<string, string> }

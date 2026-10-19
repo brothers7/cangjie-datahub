@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -184,29 +186,42 @@ async def metadata(db: AsyncSession = Depends(get_db), user=Depends(get_current_
     for t in (await db.execute(select(EtlTask).where(EtlTask.azkaban_project != ""))).scalars():
         local[(t.azkaban_project, t.azkaban_flow)] = str(t.id)
 
-    out = []
-    for p in projects[:20]:
-        proj = {"name": p["name"], "flows": []}
+    # projects×flows×2 的串行 HTTP 改为有界并发（Semaphore 限流），
+    # 单个项目/flow 失败仍不拖垮整体（沿用原有容错语义）。
+    sem = asyncio.Semaphore(8)
+
+    async def _bounded(coro):
+        async with sem:
+            return await coro
+
+    async def _flows_of(p: dict) -> list[str]:
         try:
-            flows = await client.list_flows(p["name"])
+            return await _bounded(client.list_flows(p["name"]))
         except azk.AzkabanError:
-            flows = []
-        for fl in flows[:30]:
-            info: dict = {"flow": fl, "cron": "", "linked_task_id": local.get((p["name"], fl))}
-            try:
-                if p.get("project_id"):
-                    sched = await client.fetch_schedule(p["project_id"], fl)
-                    if sched:
-                        info["cron"] = sched["cron"]
-                execs = await client.flow_executions(p["name"], fl, limit=1)
-                if execs:
-                    e = execs[0]
-                    info["last_status"] = e.get("status")
-                    info["last_end_time"] = e.get("endTime")
-            except azk.AzkabanError:
-                pass
-            proj["flows"].append(info)
-        out.append(proj)
+            return []
+
+    async def _flow_info(p: dict, fl: str) -> dict:
+        info: dict = {"flow": fl, "cron": "", "linked_task_id": local.get((p["name"], fl))}
+        try:
+            if p.get("project_id"):
+                sched = await _bounded(client.fetch_schedule(p["project_id"], fl))
+                if sched:
+                    info["cron"] = sched["cron"]
+            execs = await _bounded(client.flow_executions(p["name"], fl, limit=1))
+            if execs:
+                e = execs[0]
+                info["last_status"] = e.get("status")
+                info["last_end_time"] = e.get("endTime")
+        except azk.AzkabanError:
+            pass
+        return info
+
+    sel = projects[:20]
+    flows_per_project = await asyncio.gather(*(_flows_of(p) for p in sel))
+    out = []
+    for p, flows in zip(sel, flows_per_project):
+        infos = await asyncio.gather(*(_flow_info(p, fl) for fl in flows[:30]))
+        out.append({"name": p["name"], "flows": list(infos)})
     return {"configured": True, "projects": out}
 
 

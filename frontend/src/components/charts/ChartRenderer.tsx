@@ -1,17 +1,14 @@
 /** ChartSpec（后端契约）→ ECharts option + 数值卡片 + 明细表渲染。 */
 import { useMemo } from 'react'
-import { CATEGORICAL, Chart, themeColors } from '@/components/charts/Chart'
+import { CATEGORICAL, Chart, themeColors, useThemeTick } from '@/components/charts/Chart'
+import { fmtNum } from '@/components/common/ui'
 import type { ChartSpec } from '@/types'
 import type { EChartsOption } from 'echarts'
 
+// 复用 ui.tsx 的 fmtNum，仅补单位后缀与非有限值兜底
 const fmt = (v: number | null | undefined, unit = '') => {
   if (v === null || v === undefined || !Number.isFinite(v)) return '-'
-  const abs = Math.abs(v)
-  let s: string
-  if (abs >= 1e8) s = (v / 1e8).toFixed(2) + ' 亿'
-  else if (abs >= 1e4) s = (v / 1e4).toFixed(2) + ' 万'
-  else if (Number.isInteger(v)) s = v.toLocaleString('zh-CN')
-  else s = v.toLocaleString('zh-CN', { maximumFractionDigits: 2 })
+  const s = fmtNum(v)
   return unit ? `${s}${unit}` : s
 }
 
@@ -138,7 +135,9 @@ function buildOption(spec: ChartSpec): EChartsOption {
 }
 
 export function ChartRenderer({ spec }: { spec: ChartSpec }) {
-  const option = useMemo(() => buildOption(spec), [spec])
+  // 主题 CSS 变量随系统亮/暗切换：tick 变化时重建 option
+  const themeTick = useThemeTick()
+  const option = useMemo(() => buildOption(spec), [spec, themeTick])
   const unit = spec.unit || ''
   const c = themeColors()
 

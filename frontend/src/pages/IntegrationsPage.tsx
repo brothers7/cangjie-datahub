@@ -1,7 +1,7 @@
 /** 集成与技能页（管理员）：通用自定义 Skill 托管（PRD 3.3C）+ 调度平台配置（PRD 3.3G）。 */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, ApiError } from '@/api/client'
-import { Field, relTime, StatusTag, Tabs } from '@/components/common/ui'
+import { Confirm, Field, relTime, StatusTag, Tabs } from '@/components/common/ui'
 import { useI18n } from '@/i18n'
 import { toast } from '@/stores/app'
 import type { AirflowConfigOut, AzkabanConfigOut, CustomSkillRow } from '@/types'
@@ -31,6 +31,7 @@ function SkillsPanel() {
   const { t, lang } = useI18n()
   const [rows, setRows] = useState<CustomSkillRow[]>([])
   const [busy, setBusy] = useState(false)
+  const [confirmDel, setConfirmDel] = useState<CustomSkillRow | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
   const load = useCallback(async () => {
@@ -68,10 +69,10 @@ function SkillsPanel() {
   }
 
   const remove = async (s: CustomSkillRow) => {
-    if (!window.confirm(t('admin.integ.confirmDeleteSkill', { name: s.name, version: s.version }))) return
     try {
       await api.deleteSkill(s.id)
       toast.ok(t('common.deleted'))
+      setConfirmDel(null)
       await load()
     } catch (e) {
       toast.error((e as ApiError).message)
@@ -136,7 +137,7 @@ function SkillsPanel() {
                           {s.status === 'enabled'
                             ? <button className="btn sm" onClick={() => void setStatus(s, 'disabled')}>{t('common.disable')}</button>
                             : <button className="btn sm primary" onClick={() => void setStatus(s, 'enabled')}>{t('common.enable')}</button>}
-                          <button className="btn sm danger" onClick={() => void remove(s)}>{t('common.delete')}</button>
+                          <button className="btn sm danger" onClick={() => setConfirmDel(s)}>{t('common.delete')}</button>
                         </div>
                       </td>
                     </tr>
@@ -151,6 +152,12 @@ function SkillsPanel() {
           <summary className="tiny muted" style={{ cursor: 'pointer' }}>{t('admin.integ.sampleToggle')}</summary>
           <pre className="tiny" style={{ whiteSpace: 'pre-wrap' }}>{t('admin.integ.skillSample')}</pre>
         </details>
+
+        {confirmDel && (
+          <Confirm title={t('admin.integ.deleteSkillTitle')} danger okText={t('common.delete')}
+            text={t('admin.integ.confirmDeleteSkill', { name: confirmDel.name, version: confirmDel.version })}
+            onCancel={() => setConfirmDel(null)} onOk={() => void remove(confirmDel)} />
+        )}
       </div>
     </div>
   )
@@ -386,6 +393,7 @@ function SchedulerSkillsPanel() {
   const { t } = useI18n()
   const [rows, setRows] = useState<CustomSkillRow[]>([])
   const [busy, setBusy] = useState(false)
+  const [confirmDel, setConfirmDel] = useState<CustomSkillRow | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
   const load = useCallback(async () => {
@@ -423,10 +431,10 @@ function SchedulerSkillsPanel() {
   }
 
   const remove = async (s: CustomSkillRow) => {
-    if (!window.confirm(t('admin.integ.confirmDeleteSched', { name: s.name, version: s.version }))) return
     try {
       await api.deleteSkill(s.id)
       toast.ok(t('common.deleted'))
+      setConfirmDel(null)
       await load()
     } catch (e) {
       toast.error((e as ApiError).message)
@@ -476,13 +484,19 @@ function SchedulerSkillsPanel() {
                       {s.status === 'enabled'
                         ? <button className="btn ghost sm" onClick={() => void setStatus(s, 'disabled')}>{t('common.disable')}</button>
                         : <button className="btn sm" onClick={() => void setStatus(s, 'enabled')}>{t('common.enable')}</button>}
-                      <button className="btn danger sm" onClick={() => void remove(s)}>{t('common.delete')}</button>
+                      <button className="btn danger sm" onClick={() => setConfirmDel(s)}>{t('common.delete')}</button>
                     </div>
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
+        )}
+
+        {confirmDel && (
+          <Confirm title={t('admin.integ.deleteSkillTitle')} danger okText={t('common.delete')}
+            text={t('admin.integ.confirmDeleteSched', { name: confirmDel.name, version: confirmDel.version })}
+            onCancel={() => setConfirmDel(null)} onOk={() => void remove(confirmDel)} />
         )}
       </div>
     </div>

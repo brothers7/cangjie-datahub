@@ -5,6 +5,7 @@ import logging
 import re
 import uuid
 
+from sqlalchemy import or_ as _or_
 from sqlalchemy import select
 
 from app.connectors.base import ColumnMeta, TableMeta
@@ -155,6 +156,10 @@ async def build_kg(session, ds_id: uuid.UUID, meta_table: MetaTable, tm: TableMe
     stats = stats or KgBuildStats()
     stats_by_col = stats_by_col or {}
 
+    # 预取与本表相关的已存在边到内存集合（本表指标发出的边 / 指向本表的边 / 本表发出的边），
+    # 后续建边差集后批量 add，替代每边一次 SELECT（指标×维度边数量级最大）。
+    edge_keys = await _table_edge_keys(session, meta_table)
+
     # 已有列 ORM 对象
     col_rows: dict[str, MetaColumn] = {
         c.column_name: c for c in (await session.execute(
@@ -198,7 +203,7 @@ async def build_kg(session, ds_id: uuid.UUID, meta_table: MetaTable, tm: TableMe
             await session.flush()
             stats.entities_created += 1
             await _edge(session, EntityType.METRIC, m.id, EntityType.TABLE, meta_table.id,
-                        EdgeType.METRIC_ON_TABLE)
+                        EdgeType.METRIC_ON_TABLE, known=edge_keys)
         else:
             if is_fully_protected(existing) or is_tombstoned(existing):
                 stats.entities_skipped_manual += 1
@@ -251,7 +256,7 @@ async def build_kg(session, ds_id: uuid.UUID, meta_table: MetaTable, tm: TableMe
             stats.entities_updated += 1
         dim_ids_on_table.append(dim.id)
         await _edge(session, EntityType.DIMENSION, dim.id, EntityType.TABLE, meta_table.id,
-                    EdgeType.DIM_ON_TABLE)
+                    EdgeType.DIM_ON_TABLE, known=edge_keys)
 
     # ---- METRIC_DIM_ALLOWED：同表指标×维度 共现关系（约束校验的默认白名单） ----
     table_metrics = (await session.execute(
@@ -262,7 +267,7 @@ async def build_kg(session, ds_id: uuid.UUID, meta_table: MetaTable, tm: TableMe
             continue
         for did in dim_ids_on_table:
             await _edge(session, EntityType.METRIC, m.id, EntityType.DIMENSION, did,
-                        EdgeType.METRIC_DIM_ALLOWED)
+                        EdgeType.METRIC_DIM_ALLOWED, known=edge_keys)
 
     # ---- TABLE_JOIN：库内声明了外键的优先用外键 ----
     # 命名约定推断无法覆盖的表关系由 infer_table_joins 在整库扫描结束后补齐。
@@ -276,7 +281,8 @@ async def build_kg(session, ds_id: uuid.UUID, meta_table: MetaTable, tm: TableMe
                         ref_table.id, EdgeType.TABLE_JOIN,
                         properties={"join_keys": [fk["column"], fk["ref_column"]],
                                     "left_key": fk["column"], "right_key": fk["ref_column"],
-                                    "join_type": "left", "inferred": False})
+                                    "join_type": "left", "inferred": False},
+                        known=edge_keys)
 
 
 async def infer_table_joins(session, ds_id: uuid.UUID) -> int:
@@ -314,6 +320,12 @@ async def infer_table_joins(session, ds_id: uuid.UUID) -> int:
                 pk_col_index.setdefault((x.column_name or "").lower(), t)
 
     created = 0
+    # 整批预取已存在的 TABLE_JOIN 边，差集后批量 add（替代每候选边一次 SELECT）
+    join_keys_known = {(r[0], str(r[1]), str(r[2]), str(r[3]), str(r[4]))
+                       for r in (await session.execute(
+                           select(KgEdge.edge_type, KgEdge.src_type, KgEdge.src_id,
+                                  KgEdge.dst_type, KgEdge.dst_id)
+                           .where(KgEdge.edge_type == EdgeType.TABLE_JOIN))).all()}
     for t in tables:
         if t.layer == TableLayer.DIM:
             continue  # 维表之间不再连（雪花模型的中间维表由人工维护）
@@ -335,7 +347,8 @@ async def infer_table_joins(session, ds_id: uuid.UUID) -> int:
                            EdgeType.TABLE_JOIN,
                            properties={"join_keys": [col, pk.column_name],
                                        "left_key": col, "right_key": pk.column_name,
-                                       "join_type": "left", "inferred": True}):
+                                       "join_type": "left", "inferred": True},
+                           known=join_keys_known):
                 created += 1
     return created
 
@@ -364,9 +377,40 @@ async def _unique_metric_name(session, base: str, meta_table: MetaTable) -> str:
             return f"{name[:96]}~"
 
 
+async def _table_edge_keys(session, meta_table: MetaTable) -> set[tuple]:
+    """预取与本表相关的已存在边 key 集合：本表指标发出的边（ALLOWED/METRIC_ON_TABLE）、
+    指向本表的边（DIM_ON_TABLE/METRIC_ON_TABLE）、本表作为 src 的边（TABLE_JOIN/外键）。"""
+    metric_ids = select(KgMetric.id).where(KgMetric.table_id == meta_table.id)
+    rows = (await session.execute(
+        select(KgEdge.edge_type, KgEdge.src_type, KgEdge.src_id,
+               KgEdge.dst_type, KgEdge.dst_id)
+        .where(_or_(
+            KgEdge.src_id.in_(metric_ids),
+            KgEdge.dst_id == meta_table.id,
+            KgEdge.src_id == meta_table.id,
+        )))).all()
+    return {(r[0], str(r[1]), str(r[2]), str(r[3]), str(r[4])) for r in rows}
+
+
 async def _edge(session, src_type: EntityType, src_id, dst_type: EntityType, dst_id,
-                edge_type: EdgeType, properties: dict | None = None) -> bool:
-    """幂等建边，返回是否新建（已存在返回 False）。"""
+                edge_type: EdgeType, properties: dict | None = None,
+                known: set[tuple] | None = None) -> bool:
+    """幂等建边，返回是否新建（已存在返回 False）。
+
+    known 非空时走「预取集合 + 差集」路径：调用方一次性预取已存在边，
+    本函数只做内存比对并登记新 key（防同批重复 add），消除每边一次 SELECT；
+    库层唯一约束 uq_edge 仍作为并发兜底。
+    """
+    if known is not None:
+        key = (edge_type, str(src_type), str(src_id), str(dst_type), str(dst_id))
+        if key in known:
+            return False
+        known.add(key)
+        session.add(KgEdge(src_type=src_type, src_id=src_id, dst_type=dst_type,
+                           dst_id=dst_id, edge_type=edge_type,
+                           properties=properties or {}, source=SourceKind.AUTO))
+        await session.flush()
+        return True
     hit = (await session.execute(
         select(KgEdge).where(KgEdge.edge_type == edge_type, KgEdge.src_type == src_type,
                              KgEdge.src_id == src_id, KgEdge.dst_type == dst_type,

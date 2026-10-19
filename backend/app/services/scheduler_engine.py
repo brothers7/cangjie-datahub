@@ -8,9 +8,11 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 
+import sqlalchemy as sa
 import sqlglot
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import select
@@ -175,11 +177,9 @@ async def _execute_run(db: AsyncSession, run: SchedulerRun, task: EtlTask) -> No
         # 引擎直连执行（绕过只读 execute）：仅在双重闸门后到达此处
         def _run() -> None:
             eng = conn.engine()
-            import sqlalchemy as sa
             with eng.begin() as c:
                 for stmt in split_statements(sql):
                     c.execute(sa.text(stmt))
-        import asyncio
         await asyncio.to_thread(_run)
         run.status = SchedulerRunStatus.SUCCESS
         run.message = ""
@@ -246,7 +246,9 @@ async def tick(db: AsyncSession, now: datetime | None = None) -> dict:
 
 async def trigger(db: AsyncSession, task: EtlTask, user, ds: str = "") -> SchedulerRun:
     """手动触发（立即运行）：同样走依赖检查与双重闸门。"""
-    ds = ds or business_day(datetime.now())
+    # 与 tick 口径一致用 local_now()：服务器本地时区非 Asia/Shanghai 时，
+    # datetime.now() 算出的 ds 会与定时节拍差一天
+    ds = ds or business_day(local_now())
     run = SchedulerRun(task_id=task.id, ds=ds, status=SchedulerRunStatus.WAITING,
                        trigger_type="manual")
     db.add(run)

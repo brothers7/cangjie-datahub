@@ -70,9 +70,13 @@ async def get_graph(datasource_id: str | None = None, q: str | None = None,
 
     node_ids = {n["id"] for n in nodes}
     type_by_id = {n["id"]: n["type"] for n in nodes}
-    for e in (await db.execute(select(KgEdge).limit(2000))).scalars():
-        sid, did = str(e.src_id), str(e.dst_id)
-        if sid in node_ids and did in node_ids:
+    if node_ids:
+        # SQL 层按可见节点集合过滤边（非 admin 时即权限表集合），不再全表拉取后内存过滤
+        visible = [_u.UUID(x) for x in node_ids]
+        eq = select(KgEdge).where(KgEdge.src_id.in_(visible),
+                                  KgEdge.dst_id.in_(visible)).limit(2000)
+        for e in (await db.execute(eq)).scalars():
+            sid, did = str(e.src_id), str(e.dst_id)
             edges_out.append({"src": sid, "src_type": type_by_id[sid],
                               "dst": did, "dst_type": type_by_id[did],
                               "edge_type": e.edge_type.value,
@@ -217,7 +221,23 @@ async def metric_ctx(metric_id: str, db: AsyncSession = Depends(get_db), _=Depen
 async def list_dimensions(q: str | None = None, db: AsyncSession = Depends(get_db),
                           user=Depends(get_current_user)):
     rows = (await db.execute(select(KgDimension).order_by(KgDimension.name))).scalars().all()
-    out = [_dim_out(d) for d in rows]
+    # 非 admin：related_columns 剔除无权数据源的落点列
+    allowed_tables: set[str] | None = None
+    allowed = await accessible_datasource_ids(db, user)
+    if allowed is not None:
+        if allowed:
+            tids = (await db.execute(select(MetaTable.id).where(
+                MetaTable.datasource_id.in_(allowed)))).scalars().all()
+            allowed_tables = {str(t) for t in tids}
+        else:
+            allowed_tables = set()
+    out = []
+    for d in rows:
+        row = _dim_out(d)
+        if allowed_tables is not None:
+            row["related_columns"] = [r for r in row["related_columns"]
+                                      if str(r.get("table_id")) in allowed_tables]
+        out.append(row)
     if q:
         ql = q.lower()
         out = [d for d in out if ql in d["name"].lower()]

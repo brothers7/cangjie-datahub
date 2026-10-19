@@ -36,7 +36,11 @@ def _finding(domain: str, level: str, obj: str, title: str, evidence: str,
 
 
 async def run_rule_engine(db: AsyncSession, ds_ids: list | None) -> list[dict]:
-    """执行全部规则检查，返回治理项列表（按级别 block > warn > info 排序）。"""
+    """执行全部规则检查，返回治理项列表（按级别 block > warn > info 排序）。
+
+    ds_ids 为 None 表示不限制（admin）；否则元数据表与 ETL 任务都按该数据源集合收窄，
+    非 admin 巡检看不到无权数据源的表与任务。
+    """
     findings: list[dict] = []
 
     tq = select(MetaTable)
@@ -46,7 +50,11 @@ async def run_rule_engine(db: AsyncSession, ds_ids: list | None) -> list[dict]:
     tname = {t.table_name: t for t in tables}
     layer_of = {(t.table_name or "").lower(): t.layer.value for t in tables}
 
-    tasks = list((await db.execute(select(EtlTask))).scalars())
+    task_q = select(EtlTask)
+    if ds_ids is not None:
+        # 非 admin：任务同样按有权数据源收窄（未绑定数据源的任务不纳入收窄后的巡检）
+        task_q = task_q.where(EtlTask.datasource_id.in_(ds_ids))
+    tasks = list((await db.execute(task_q)).scalars())
     # 分层索引：元数据表 + 任务目标表（未入元数据的在建表也能参与跨层判断）
     for task in tasks:
         if task.target_table and task.layer:

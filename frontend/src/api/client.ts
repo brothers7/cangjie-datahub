@@ -33,7 +33,10 @@ export const tokenStore = {
 let onUnauthorized: (() => void) | null = null
 export const setUnauthorizedHandler = (fn: () => void) => { onUnauthorized = fn }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+/** 默认请求超时：30s；建模/问答等长请求由调用方传入更大的 timeoutMs 覆盖 */
+const DEFAULT_TIMEOUT_MS = 30_000
+
+async function request<T>(path: string, init: RequestInit = {}, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<T> {
   const headers = new Headers(init.headers)
   const token = tokenStore.get()
   if (token) headers.set('Authorization', `Bearer ${token}`)
@@ -41,8 +44,14 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   let resp: Response
   try {
-    resp = await fetch(`/api/v1${path}`, { ...init, headers })
-  } catch {
+    resp = await fetch(`/api/v1${path}`, {
+      ...init, headers,
+      signal: init.signal ?? AbortSignal.timeout(timeoutMs),
+    })
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'TimeoutError') {
+      throw new ApiError('请求超时，请稍后重试', 'TIMEOUT', 0)
+    }
     throw new ApiError('网络请求失败，请检查后端服务是否启动', 'NETWORK', 0)
   }
 
@@ -281,14 +290,15 @@ export const api = {
     request<{ id: string; ok: boolean }>('/azkaban/import',
       { method: 'POST', body: JSON.stringify({ project, flow, cron }) }),
   modelingOverview: () => request<ModelingOverview>('/modeling/overview'),
+  // 建模建议 / AI 编辑为 LLM 长请求，放宽到 120s
   modelingAdvice: () =>
-    request<ModelingAdvice>('/modeling/advice', { method: 'POST', body: '{}' }),
+    request<ModelingAdvice>('/modeling/advice', { method: 'POST', body: '{}' }, 120_000),
   completionData: (datasource_id?: string) =>
     request<CompletionData>(`/modeling/completion-data${qs({ datasource_id })}`),
   aiEdit: (body: { mode: string; instruction?: string; ddl?: string; etl_sql?: string
     datasource_id?: string | null; dialect?: string }) =>
     request<{ sql?: string; text?: string; warnings?: string[] }>('/modeling/ai-edit',
-      { method: 'POST', body: JSON.stringify(body) }),
+      { method: 'POST', body: JSON.stringify(body) }, 120_000),
 
   // ---- AI 建模建议会话（PRD 3.3D-1） ----
   runGovernance: () =>

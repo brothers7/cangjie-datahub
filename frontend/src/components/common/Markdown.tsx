@@ -4,9 +4,14 @@ import { useMemo } from 'react'
 const esc = (s: string) => s
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
-/** 行内：粗体、行内代码、（不渲染任意 HTML/脚本） */
+/** 行内：粗体、行内代码、http/https 链接（不渲染任意 HTML/脚本） */
 function inline(s: string): string {
   return esc(s)
+    // 链接必须在 esc 之后处理：文本已转义，URL 白名单限 http/https，
+    // 且 URL 内引号统一转 %22，避免从 href 属性逃逸
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+      (_m, text: string, url: string) =>
+        `<a href="${url.split('"').join('%22')}" target="_blank" rel="noreferrer">${text}</a>`)
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     .replace(/`([^`]+)`/g, '<code>$1</code>')
 }

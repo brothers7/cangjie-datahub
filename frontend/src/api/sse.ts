@@ -39,6 +39,44 @@ const EVENT_MAP: Record<string, keyof SseHandlers> = {
 }
 
 /**
+ * 通用 SSE 流读取与行解析：event:/data: 按空行组装为一条事件后交给 dispatch。
+ * streamAsk / streamSse 共用，保证两处解析行为一致。
+ */
+async function parseSseStream(resp: Response, dispatch: (name: string, raw: string) => void): Promise<void> {
+  if (!resp.body) return
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buf = ''
+  let eventName = ''
+  let dataLines: string[] = []
+
+  const flush = () => {
+    if (!dataLines.length) { eventName = ''; return }
+    const raw = dataLines.join('\n')
+    const name = eventName
+    eventName = ''
+    dataLines = []
+    if (name) dispatch(name, raw)
+  }
+
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let idx: number
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, idx).replace(/\r$/, '')
+      buf = buf.slice(idx + 1)
+      if (line === '') { flush(); continue }
+      if (line.startsWith(':')) continue      // heartbeat
+      if (line.startsWith('event:')) eventName = line.slice(6).trim()
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+    }
+  }
+  flush()
+}
+
+/**
  * 发起一次问答流。返回 abort 函数。
  * 事件顺序：meta → step* → kg_match → sql → … → chart → token* → report → done
  */
@@ -81,52 +119,27 @@ export function streamAsk(
       return
     }
 
-    const reader = resp.body.getReader()
-    const decoder = new TextDecoder('utf-8')
-    let buf = ''
-    let eventName = ''
-    let dataLines: string[] = []
-
-    const flush = () => {
-      if (!dataLines.length) { eventName = ''; return }
-      const raw = dataLines.join('\n')
-      const name = eventName
-      eventName = ''
-      dataLines = []
-      if (!name) return
-
-      if (name === 'token') {
+    let gotDone = false  // 是否收到 done 事件（用于静默断流兜底）
+    try {
+      await parseSseStream(resp, (name, raw) => {
+        if (name === 'token') {
+          try {
+            const d = JSON.parse(raw)
+            if (d.text) handlers.onToken?.(d.text)
+          } catch { /* ignore */ }
+          return
+        }
+        const key = EVENT_MAP[name]
+        if (!key) return
+        if (name === 'done') gotDone = true
         try {
           const d = JSON.parse(raw)
-          if (d.text) handlers.onToken?.(d.text)
-        } catch { /* ignore */ }
-        return
-      }
-      const key = EVENT_MAP[name]
-      if (!key) return
-      try {
-        const d = JSON.parse(raw)
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        ;(handlers[key] as ((x: any) => void) | undefined)?.(d)
-      } catch { /* 忽略无法解析的事件 */ }
-    }
-
-    try {
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buf += decoder.decode(value, { stream: true })
-        let idx: number
-        while ((idx = buf.indexOf('\n')) >= 0) {
-          const line = buf.slice(0, idx).replace(/\r$/, '')
-          buf = buf.slice(idx + 1)
-          if (line === '') { flush(); continue }
-          if (line.startsWith(':')) continue      // heartbeat
-          if (line.startsWith('event:')) eventName = line.slice(6).trim()
-          else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
-        }
-      }
-      flush()
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ;(handlers[key] as ((x: any) => void) | undefined)?.(d)
+        } catch { /* 忽略无法解析的事件 */ }
+      })
+      // 静默断流兜底：流正常结束但从未收到 done 事件时补一次，避免 UI 永久卡在 running
+      if (!gotDone) handlers.onDone?.({ duration_ms: 0, error: 'closed' })
     } catch (e) {
       if ((e as Error).name !== 'AbortError') {
         handlers.onError?.({ code: 'STREAM_ERROR', message: '数据流中断，请重试' })
@@ -198,38 +211,19 @@ export function streamSse(url: string, body: unknown, handlers: GenericSseHandle
       handlers.onDone?.({ error: message })
       return
     }
-    const reader = resp.body.getReader()
-    const decoder = new TextDecoder('utf-8')
-    let buf = '', eventName = '', dataLines: string[] = []
-    const flush = () => {
-      if (!dataLines.length) { eventName = ''; return }
-      const raw = dataLines.join('\n'), name = eventName
-      eventName = ''; dataLines = []
-      if (!name) return
-      try {
-        const d = JSON.parse(raw)
-        if (name === 'step') handlers.onStep?.(d)
-        else if (name === 'error') handlers.onError?.(d)
-        else if (name === 'done') handlers.onDone?.(d)
-        else handlers.onEvent?.(name, d)
-      } catch { /* ignore */ }
-    }
+    let gotDone = false  // 是否收到 done 事件（用于静默断流兜底）
     try {
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buf += decoder.decode(value, { stream: true })
-        let idx: number
-        while ((idx = buf.indexOf('\n')) >= 0) {
-          const line = buf.slice(0, idx).replace(/\r$/, '')
-          buf = buf.slice(idx + 1)
-          if (line === '') { flush(); continue }
-          if (line.startsWith(':')) continue
-          if (line.startsWith('event:')) eventName = line.slice(6).trim()
-          else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
-        }
-      }
-      flush()
+      await parseSseStream(resp, (name, raw) => {
+        try {
+          const d = JSON.parse(raw)
+          if (name === 'step') handlers.onStep?.(d)
+          else if (name === 'error') handlers.onError?.(d)
+          else if (name === 'done') { gotDone = true; handlers.onDone?.(d) }
+          else handlers.onEvent?.(name, d)
+        } catch { /* 忽略无法解析的事件 */ }
+      })
+      // 静默断流兜底：流正常结束但从未收到 done 事件时补一次
+      if (!gotDone) handlers.onDone?.({ error: 'closed' })
     } catch (e) {
       if ((e as Error).name !== 'AbortError') {
         handlers.onError?.({ code: 'STREAM_ERROR', message: '数据流中断，请重试' })

@@ -230,10 +230,12 @@ async def completion_data(datasource_id: str | None = None,
     elif ds_ids is not None:
         tq = tq.where(MetaTable.datasource_id.in_(ds_ids))
     tables = (await db.execute(tq)).scalars().all()
+    sel = tables[:200]
+    # 字段一次 IN 批量取回，替代逐表查询
+    cols_map = await etl_skill.columns_by_table(db, [t.id for t in sel])
     out_tables = []
-    for t in tables[:200]:
-        cols = (await db.execute(
-            select(MetaColumn).where(MetaColumn.table_id == t.id))).scalars().all()
+    for t in sel:
+        cols = cols_map.get(str(t.id), [])
         out_tables.append({
             "name": t.table_name, "comment": t.comment, "layer": t.layer.value,
             "partition_cols": t.partition_cols or [],
@@ -276,10 +278,11 @@ async def ai_edit(body: AiEditIn, db: AsyncSession = Depends(get_db),
         if ds_ids is not None and ds not in ds_ids:
             raise PermissionDenied("没有该数据源的访问权限")
         _, all_tables = await match_tables(db, ds, body.instruction or body.etl_sql[:200])
+        sel = all_tables[:40]
+        cols_map = await etl_skill.columns_by_table(db, [t.id for t in sel])
         lines = []
-        for t in all_tables[:40]:
-            cols = (await db.execute(
-                select(MetaColumn).where(MetaColumn.table_id == t.id))).scalars().all()
+        for t in sel:
+            cols = cols_map.get(str(t.id), [])
             col_str = "、".join(f"{c.column_name}({c.comment})" if c.comment else c.column_name
                                 for c in cols[:30])
             lines.append(f"- {t.table_name}（{t.layer.value}，{t.comment or '无注释'}）：{col_str}")

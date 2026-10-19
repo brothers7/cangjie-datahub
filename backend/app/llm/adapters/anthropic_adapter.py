@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 
 import httpx
 
+from app.llm.adapters import shared_client
 from app.llm.types import (BaseAdapter, ChatMessage, LLMAdapterError, LLMResponse, LLMUsage,
                            ResolvedConfig, StreamChunk)
 
@@ -70,8 +71,9 @@ class AnthropicAdapter(BaseAdapter):
                        top_p: float | None = None) -> LLMResponse:
         body = _body(cfg, messages, stream=False, temperature=temperature,
                      max_tokens=max_tokens, top_p=top_p)
-        async with httpx.AsyncClient(timeout=cfg.timeout_sec) as client:
-            resp = await client.post(_url(cfg), headers=_headers(cfg), json=body)
+        # 共享 client（按 endpoint 键控）复用连接；超时仍按配置逐请求传入
+        resp = await shared_client(cfg.endpoint).post(
+            _url(cfg), headers=_headers(cfg), json=body, timeout=cfg.timeout_sec)
         if resp.status_code != 200:
             raise _parse_error(resp)
         data = resp.json()
@@ -94,30 +96,31 @@ class AnthropicAdapter(BaseAdapter):
         body = _body(cfg, messages, stream=True, temperature=temperature,
                      max_tokens=max_tokens, top_p=top_p)
         usage = LLMUsage()
-        async with httpx.AsyncClient(timeout=cfg.timeout_sec) as client:
-            async with client.stream("POST", _url(cfg), headers=_headers(cfg), json=body) as resp:
-                if resp.status_code != 200:
-                    await resp.aread()
-                    raise _parse_error(resp)
-                async for line in resp.aiter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    payload = line[len("data:"):].strip()
-                    try:
-                        event = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-                    etype = event.get("type")
-                    if etype == "message_start":
-                        u = (event.get("message") or {}).get("usage") or {}
-                        usage.input_tokens = u.get("input_tokens", 0)
-                    elif etype == "content_block_delta":
-                        delta = event.get("delta") or {}
-                        if delta.get("type") == "text_delta" and delta.get("text"):
-                            yield StreamChunk(delta=delta["text"])
-                    elif etype == "message_delta":
-                        u = event.get("usage") or {}
-                        usage.output_tokens = u.get("output_tokens", 0)
-                    elif etype == "error":
-                        raise LLMAdapterError(str(event.get("error") or "stream error"))
+        async with shared_client(cfg.endpoint).stream(
+                "POST", _url(cfg), headers=_headers(cfg), json=body,
+                timeout=cfg.timeout_sec) as resp:
+            if resp.status_code != 200:
+                await resp.aread()
+                raise _parse_error(resp)
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[len("data:"):].strip()
+                try:
+                    event = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                etype = event.get("type")
+                if etype == "message_start":
+                    u = (event.get("message") or {}).get("usage") or {}
+                    usage.input_tokens = u.get("input_tokens", 0)
+                elif etype == "content_block_delta":
+                    delta = event.get("delta") or {}
+                    if delta.get("type") == "text_delta" and delta.get("text"):
+                        yield StreamChunk(delta=delta["text"])
+                elif etype == "message_delta":
+                    u = event.get("usage") or {}
+                    usage.output_tokens = u.get("output_tokens", 0)
+                elif etype == "error":
+                    raise LLMAdapterError(str(event.get("error") or "stream error"))
         yield StreamChunk(usage=usage, done=True)

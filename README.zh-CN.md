@@ -174,7 +174,7 @@ make up          # 首次运行会从 .env.example 复制 .env；务必修改其
 ```bash
 # 后端（Python 3.11+）
 cd backend && python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e ".[dev]"
 uvicorn app.main:app --port 9111
 
 # 前端（Node 18+）

@@ -107,6 +107,9 @@ class TestLikeEscape:
         r = await app_client.get(f"/api/v1/modeling/task-metadata?q=t_{tag}_a%25b", headers=ah)
         names = [t["name"] for t in r.json()["tables"]]
         assert f"t_{tag}_a%b" in names and f"t_{tag}_axb" not in names
+        # 清理数据源，避免影响其他用例的列表计数断言
+        await committed.delete(ds)
+        await committed.commit()
 
 
 class TestReadonlyGate:

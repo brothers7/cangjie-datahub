@@ -5,7 +5,7 @@ import uuid
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, require_admin
@@ -13,6 +13,7 @@ from app.core.crypto import encrypt
 from app.core.errors import NotFoundError, ValidationError
 from app.db.models import AuditLog, LlmCallLog, LlmConfig, LlmScene, LlmSceneBinding, ModelKind, Protocol
 from app.db.models.base import utcnow
+from app.db.models.llm import CallStatus
 from app.db.session import get_db
 from app.llm.gateway import invalidate_config_cache
 from app.llm.health import check_config
@@ -66,6 +67,7 @@ async def create_config(body: LlmConfigIn, db: AsyncSession = Depends(get_db),
                     detail={"name": body.name, "protocol": body.protocol, "model": body.model}))
     await db.commit()
     await db.refresh(cfg)
+    invalidate_config_cache()  # 新建配置（尤其设为默认）立即生效
     return cfg
 
 
@@ -92,6 +94,7 @@ async def update_config(config_id: str, body: LlmConfigUpdateIn,
                     resource_type="llm_config", resource_id=str(cfg.id)))
     await db.commit()
     await db.refresh(cfg)
+    invalidate_config_cache()  # 配置变更（endpoint/模型/密钥/默认标记）立即生效
     return cfg
 
 
@@ -176,22 +179,29 @@ async def set_bindings(body: dict, db: AsyncSession = Depends(get_db),
 @router.get("/usage")
 async def usage(group_by: str = "day", days: int = 14,
                 db: AsyncSession = Depends(get_db), _=Depends(require_admin)):
+    """用量统计：SQL 侧 group_by 聚合（不再全量拉日志进内存）。"""
     since = utcnow() - timedelta(days=min(days, 90))
-    q = select(LlmCallLog).where(LlmCallLog.created_at >= since)
-    logs = (await db.execute(q)).scalars().all()
-    buckets: dict[str, dict] = {}
-    for r in logs:
-        key = r.created_at.strftime("%Y-%m-%d") if group_by == "day" else (
-            r.scene or "default" if group_by == "scene" else (r.model or "unknown"))
-        b = buckets.setdefault(key, {"input_tokens": 0, "output_tokens": 0,
-                                     "calls": 0, "errors": 0})
-        b["input_tokens"] += r.input_tokens
-        b["output_tokens"] += r.output_tokens
-        b["calls"] += 1
-        if r.status != "ok":
-            b["errors"] += 1
+    if group_by == "day":
+        # func.date 在 SQLite/MySQL 均可用，结果统一截成 YYYY-MM-DD 字符串
+        key_expr = func.date(LlmCallLog.created_at)
+    elif group_by == "scene":
+        key_expr = func.coalesce(func.nullif(LlmCallLog.scene, ""), "default")
+    else:
+        key_expr = func.coalesce(func.nullif(LlmCallLog.model, ""), "unknown")
+    q = (select(key_expr.label("k"),
+                func.coalesce(func.sum(LlmCallLog.input_tokens), 0).label("input_tokens"),
+                func.coalesce(func.sum(LlmCallLog.output_tokens), 0).label("output_tokens"),
+                func.count(LlmCallLog.id).label("calls"),
+                func.coalesce(func.sum(
+                    case((LlmCallLog.status != CallStatus.OK, 1), else_=0)), 0).label("errors"))
+         .where(LlmCallLog.created_at >= since)
+         .group_by("k").order_by("k"))
+    rows = (await db.execute(q)).all()
     return {"group_by": group_by,
-            "rows": [{"key": k, **v} for k, v in sorted(buckets.items())]}
+            "rows": [{"key": str(k)[:10] if group_by == "day" else str(k),
+                      "input_tokens": int(it), "output_tokens": int(ot),
+                      "calls": int(c), "errors": int(e)}
+                     for k, it, ot, c, e in rows]}
 
 
 @router.get("/call-logs")

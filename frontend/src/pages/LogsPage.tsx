@@ -3,11 +3,13 @@ import { SqlText } from '@/components/common/SqlText'
 import { Fragment, useCallback, useEffect, useState } from 'react'
 import { api, ApiError } from '@/api/client'
 import { Empty, Pager, Spinner, StatusTag, Tabs } from '@/components/common/ui'
+import { LlmLogsTable } from '@/components/logs/LlmLogsTable'
+import { useDebouncedValue } from '@/hooks/useDebouncedValue'
 import { useI18n } from '@/i18n'
-import { auditActions, auditLabel, queryStatus, sceneLabels } from '@/labels'
+import { auditActions, auditLabel, queryStatus } from '@/labels'
 import { toast, useApp } from '@/stores/app'
 import { useAuth } from '@/stores/auth'
-import type { AuditLogRow, LlmCallLog, QueryRecordRow } from '@/types'
+import type { AuditLogRow, QueryRecordRow } from '@/types'
 
 type Tab = 'queries' | 'llm' | 'audit'
 const PAGE_SIZE = 20
@@ -52,6 +54,7 @@ function QueriesPane() {
   const [dsId, setDsId] = useState('')
   const [mine, setMine] = useState(false)
   const [q, setQ] = useState('')
+  const dq = useDebouncedValue(q)  // 搜索防抖后再进 load 依赖
   const [loading, setLoading] = useState(true)
   const [expanded, setExpanded] = useState<string | null>(null)
 
@@ -62,7 +65,7 @@ function QueriesPane() {
     try {
       const r = await api.listQueryRecords({
         mine, status: status || undefined,
-        datasource_id: dsId || undefined, q: q || undefined, page, page_size: PAGE_SIZE,
+        datasource_id: dsId || undefined, q: dq || undefined, page, page_size: PAGE_SIZE,
       })
       setRows(r.rows)
       setTotal(r.total)
@@ -71,7 +74,7 @@ function QueriesPane() {
     } finally {
       setLoading(false)
     }
-  }, [mine, status, dsId, q, page])
+  }, [mine, status, dsId, dq, page])
 
   useEffect(() => { void load() }, [load])
 
@@ -168,77 +171,22 @@ function QueriesPane() {
 // ---------------- LLM 调用 ----------------
 
 function LlmPane() {
-  const { t, lang } = useI18n()
-  const locale = lang === 'zh' ? 'zh-CN' : 'en-US'
-  const scenes = sceneLabels(lang)
-  const [rows, setRows] = useState<LlmCallLog[]>([])
-  const [total, setTotal] = useState(0)
-  const [page, setPage] = useState(1)
-  const [status, setStatus] = useState('')
-  const [scene, setScene] = useState('')
-  const [loading, setLoading] = useState(true)
-
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const r = await api.llmCallLogs({ status: status || undefined, scene: scene || undefined, page, page_size: PAGE_SIZE })
-      setRows(r.rows)
-      setTotal(r.total)
-    } catch (e) {
-      toast.error((e as ApiError).message)
-    } finally {
-      setLoading(false)
-    }
-  }, [status, scene, page])
-
-  useEffect(() => { void load() }, [load])
-
-  const totTokens = rows.reduce((a, r) => a + r.input_tokens + r.output_tokens, 0)
-
+  const { t } = useI18n()
   return (
-    <div className="card">
-      <div className="card-head">
-        <h2>{t('admin.logs.llmTitle')}</h2>
-        <span className="tag">{t('admin.logs.pageTokens', { n: totTokens.toLocaleString() })}</span>
-        <span className="spacer" />
-        <select className="select" style={{ width: 130 }} value={status}
-          onChange={(e) => { setStatus(e.target.value); setPage(1) }}>
-          <option value="">{t('common.allStatus')}</option>
-          {['ok', 'timeout', 'error', 'degraded'].map((s) => <option key={s} value={s}>{s}</option>)}
-        </select>
-        <select className="select" style={{ width: 150 }} value={scene}
-          onChange={(e) => { setScene(e.target.value); setPage(1) }}>
-          <option value="">{t('admin.logs.allScenes')}</option>
-          {Object.entries(scenes).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-        </select>
-      </div>
-      <div style={{ overflow: 'auto' }}>
-        <table className="table">
-          <thead><tr><th>{t('common.time')}</th><th>{t('admin.logs.colScene')}</th><th>{t('admin.logs.colModel')}</th>
-            <th>{t('admin.logs.colInput')}</th><th>{t('admin.logs.colOutput')}</th>
-            <th>{t('admin.logs.colDuration')}</th><th>{t('common.status')}</th><th>{t('admin.logs.colErrorBrief')}</th></tr></thead>
-          <tbody>
-            {rows.map((r) => (
-              <tr key={r.id}>
-                <td className="tiny">{new Date(r.created_at).toLocaleString(locale)}</td>
-                <td>{r.scene ? (scenes[r.scene] || r.scene) : '-'}</td>
-                <td className="tiny mono">{r.model || '-'}</td>
-                <td>{r.input_tokens}</td>
-                <td>{r.output_tokens}</td>
-                <td>{r.latency_ms}ms</td>
-                <td><StatusTag value={r.status} /></td>
-                <td className="tiny truncate" style={{ maxWidth: 240, color: r.error_brief ? 'var(--danger)' : undefined }}>
-                  {r.error_brief || '-'}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {loading && <div className="center" style={{ padding: 24 }}><Spinner /></div>}
-        {!loading && !rows.length && <Empty icon="📜" text={t('admin.logs.emptyLlm')} />}
-      </div>
-      <Pager page={page} pageSize={PAGE_SIZE} total={total} onChange={setPage} />
-    </div>
+    <LlmLogsTable
+      title={t('admin.logs.llmTitle')}
+      allScenesText={t('admin.logs.allScenes')}
+      modelColText={t('admin.logs.colModel')}
+      errorColText={t('admin.logs.colErrorBrief')}
+      emptyText={t('admin.logs.emptyLlm')}
+      headerExtra={(rows) => (
+        <span className="tag">
+          {t('admin.logs.pageTokens', {
+            n: rows.reduce((a, r) => a + r.input_tokens + r.output_tokens, 0).toLocaleString(),
+          })}
+        </span>
+      )}
+    />
   )
 }
 
@@ -253,13 +201,14 @@ function AuditPane() {
   const [page, setPage] = useState(1)
   const [action, setAction] = useState('')
   const [username, setUsername] = useState('')
+  const dUsername = useDebouncedValue(username)  // 搜索防抖后再进 load 依赖
   const [loading, setLoading] = useState(true)
 
   const load = useCallback(async () => {
     setLoading(true)
     try {
       const r = await api.listAuditLogs({
-        action: action || undefined, username: username || undefined, page, page_size: PAGE_SIZE,
+        action: action || undefined, username: dUsername || undefined, page, page_size: PAGE_SIZE,
       })
       setRows(r.rows)
       setTotal(r.total)
@@ -268,7 +217,7 @@ function AuditPane() {
     } finally {
       setLoading(false)
     }
-  }, [action, username, page])
+  }, [action, dUsername, page])
 
   useEffect(() => { void load() }, [load])
 

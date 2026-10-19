@@ -175,7 +175,7 @@ make up          # first run copies .env.example → .env; CHANGE THE SECRETS in
 ```bash
 # Backend (Python 3.11+)
 cd backend && python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e ".[dev]"
 uvicorn app.main:app --port 9111
 
 # Frontend (Node 18+)

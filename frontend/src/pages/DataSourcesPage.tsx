@@ -1,5 +1,5 @@
 /** 数据源管理：连接配置 / 连通性测试 / 扫描任务 / 元数据浏览与人工修正。 */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, ApiError } from '@/api/client'
 import {
   Confirm, Empty, Field, fmtTime, Modal, relTime, Spinner, StatusTag, Tabs,
@@ -19,6 +19,7 @@ const DEFAULT_PORTS: Record<string, number> = {
 }
 const LAYERS = ['ods', 'dwd', 'dws', 'ads', 'dim', 'unknown']
 const ROLES = ['metric', 'dimension', 'time', 'unknown']
+const TABLE_PAGE = 100  // 元数据表清单分批渲染步长
 
 const blankForm = () => ({
   name: '', db_type: 'mysql', host: 'localhost', port: 3306, database_name: '',
@@ -35,6 +36,7 @@ export default function DataSourcesPage() {
   const [active, setActive] = useState<Datasource | null>(null)
   const [loading, setLoading] = useState(true)
   const [form, setForm] = useState<ReturnType<typeof blankForm> | null>(null)
+  const [formErr, setFormErr] = useState<{ host?: string; port?: string }>({})
   const [editing, setEditing] = useState<Datasource | null>(null)
   const [confirmDel, setConfirmDel] = useState<Datasource | null>(null)
   const [testing, setTesting] = useState<string>('')
@@ -56,9 +58,10 @@ export default function DataSourcesPage() {
 
   useEffect(() => { void refresh() }, [refresh])
 
-  const openCreate = () => { setEditing(null); setForm(blankForm()) }
+  const openCreate = () => { setEditing(null); setFormErr({}); setForm(blankForm()) }
   const openEdit = (ds: Datasource) => {
     setEditing(ds)
+    setFormErr({})
     setForm({
       name: ds.name, db_type: ds.db_type, host: ds.host, port: ds.port,
       database_name: ds.database_name, username: ds.username, password: '',
@@ -72,6 +75,16 @@ export default function DataSourcesPage() {
 
   const save = async () => {
     if (!form) return
+    // 提交前基础校验：host 非空、端口 1-65535（sqlite 无 host/port）
+    const errs: { host?: string; port?: string } = {}
+    if (form.db_type !== 'sqlite') {
+      if (!form.host.trim()) errs.host = t('ds.errHostRequired')
+      if (!Number.isInteger(form.port) || form.port < 1 || form.port > 65535) {
+        errs.port = t('ds.errPortRange')
+      }
+    }
+    setFormErr(errs)
+    if (Object.keys(errs).length) return
     const payload: Record<string, unknown> = {
       name: form.name.trim(),
       db_type: form.db_type,
@@ -241,9 +254,9 @@ export default function DataSourcesPage() {
       {/* 新增/编辑弹窗 */}
       {form && (
         <Modal title={editing ? t('ds.editTitle') : t('ds.addTitle')} width={640}
-          onClose={() => { setForm(null); setEditing(null) }}
+          onClose={() => { setForm(null); setEditing(null); setFormErr({}) }}
           footer={<>
-            <button className="btn" onClick={() => { setForm(null); setEditing(null) }}>{t('common.cancel')}</button>
+            <button className="btn" onClick={() => { setForm(null); setEditing(null); setFormErr({}) }}>{t('common.cancel')}</button>
             <button className="btn primary" disabled={!form.name}
               onClick={() => void save()}>{editing ? t('common.save') : t('common.create')}</button>
           </>}>
@@ -266,11 +279,11 @@ export default function DataSourcesPage() {
               </Field>
               {form.db_type !== 'sqlite' && (
                 <>
-                  <Field label={t('ds.host')}>
+                  <Field label={t('ds.host')} error={formErr.host}>
                     <input className="input" value={form.host}
                       onChange={(e) => setForm({ ...form, host: e.target.value })} />
                   </Field>
-                  <Field label={t('ds.port')}>
+                  <Field label={t('ds.port')} error={formErr.port}>
                     <input className="input" type="number" value={form.port}
                       onChange={(e) => setForm({ ...form, port: Number(e.target.value) })} />
                   </Field>
@@ -352,10 +365,14 @@ function TablesPane({ ds }: { ds: Datasource }) {
   const [selected, setSelected] = useState<MetaTableRow | null>(null)
   const [columns, setColumns] = useState<MetaColumnRow[]>([])
   const [colLoading, setColLoading] = useState(false)
+  const [tableQ, setTableQ] = useState('')
+  const [showN, setShowN] = useState(TABLE_PAGE)  // 分批渲染：每次「显示更多」+100
 
   useEffect(() => {
     setLoading(true)
     setSelected(null)
+    setTableQ('')
+    setShowN(TABLE_PAGE)
     api.listTables(ds.id)
       .then(setTables)
       .catch((e: ApiError) => toast.error(e.message))
@@ -400,13 +417,22 @@ function TablesPane({ ds }: { ds: Datasource }) {
     return <Empty icon="📋" text={t('ds.noMeta')} />
   }
 
+  // 表名过滤 + 分批渲染，避免上千张表一次性挂载
+  const kw = tableQ.trim().toLowerCase()
+  const filtered = kw ? tables.filter((tb) => tb.table_name.toLowerCase().includes(kw)) : tables
+  const visible = filtered.slice(0, showN)
+
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1.2fr)', gap: 14 }}>
       <div style={{ border: '1px solid var(--border)', borderRadius: 8, overflow: 'auto', maxHeight: 460 }}>
+        <div style={{ padding: 8, borderBottom: '1px solid var(--border)', position: 'sticky', top: 0, background: 'var(--bg-elev)' }}>
+          <input className="input" style={{ width: '100%' }} placeholder={t('ds.searchTablePh')}
+            value={tableQ} onChange={(e) => { setTableQ(e.target.value); setShowN(TABLE_PAGE) }} />
+        </div>
         <table className="table">
           <thead><tr><th>{t('ds.tableName')}</th><th>{t('ds.layer')}</th><th>{t('ds.comment')}</th></tr></thead>
           <tbody>
-            {tables.map((t) => (
+            {visible.map((t) => (
               <tr key={t.id} style={{ cursor: 'pointer', background: selected?.id === t.id ? 'var(--accent-soft)' : undefined }}
                 onClick={() => void openTable(t)}>
                 <td className="mono" style={{ fontSize: 12.5 }}>{t.table_name}</td>
@@ -414,8 +440,18 @@ function TablesPane({ ds }: { ds: Datasource }) {
                 <td className="dim truncate" style={{ maxWidth: 180 }}>{t.comment || '-'}</td>
               </tr>
             ))}
+            {!visible.length && (
+              <tr><td colSpan={3} className="muted tiny center" style={{ padding: 16 }}>{t('common.noData')}</td></tr>
+            )}
           </tbody>
         </table>
+        {filtered.length > visible.length && (
+          <div className="center" style={{ padding: 8 }}>
+            <button className="btn sm" onClick={() => setShowN((n) => n + TABLE_PAGE)}>
+              {t('ds.showMore', { n: filtered.length - visible.length })}
+            </button>
+          </div>
+        )}
       </div>
 
       <div style={{ border: '1px solid var(--border)', borderRadius: 8, overflow: 'auto', maxHeight: 460 }}>
@@ -491,10 +527,14 @@ function JobsPane({ ds }: { ds: Datasource }) {
   const { t } = useI18n()
   const [jobs, setJobs] = useState<ScanJob[]>([])
   const [loading, setLoading] = useState(false)
+  // interval 回调里基于上次 fetch 结果判断是否轮询（setState updater 必须纯，不能发请求）
+  const jobsRef = useRef<ScanJob[]>([])
 
   const load = useCallback(async () => {
     try {
-      setJobs(await api.listScanJobs(ds.id, 30))
+      const rows = await api.listScanJobs(ds.id, 30)
+      jobsRef.current = rows
+      setJobs(rows)
     } catch (e) {
       toast.error((e as ApiError).message)
     } finally {
@@ -507,10 +547,7 @@ function JobsPane({ ds }: { ds: Datasource }) {
     void load()
     // 有运行中的任务时轮询刷新进度
     const timer = setInterval(() => {
-      setJobs((cur) => {
-        if (cur.some((j) => j.status === 'running')) void load()
-        return cur
-      })
+      if (jobsRef.current.some((j) => j.status === 'running')) void load()
     }, 3000)
     return () => clearInterval(timer)
   }, [load])

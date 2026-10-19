@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent.skills.etl import _extract_json, _strip_dangerous, sqlglot_check
+from app.agent.skills.etl import _extract_json, _strip_dangerous, columns_by_table, sqlglot_check
 from app.db.models import DwStandard, EtlTask, MetaColumn, MetaTable
 from app.services import dw_standards
 from app.db.models.llm import LlmScene
@@ -146,11 +146,12 @@ async def _tool_get_existing_tasks(scope: AgentScope, args: dict) -> dict:
 
 async def _tool_validate_sql(scope: AgentScope, args: dict) -> dict:
     if not scope._table_cols:
-        for t in await _scoped_tables(scope):
-            cols = (await scope.db.execute(
-                select(MetaColumn).where(MetaColumn.table_id == t.id))).scalars()
+        # 字段一次 IN 批量取回，替代逐表查询（表多时 validate_sql 首次调用会卡）
+        tables = await _scoped_tables(scope)
+        by_id = await columns_by_table(scope.db, [t.id for t in tables])
+        for t in tables:
             scope._table_cols[(t.table_name or "").lower()] = {
-                (c.column_name or "").lower() for c in cols}
+                (c.column_name or "").lower() for c in by_id.get(str(t.id), [])}
     errors = sqlglot_check(str(args.get("ddl") or ""), str(args.get("etl_sql") or ""),
                            scope.dialect, scope._table_cols)
     return {"ok": not errors, "errors": errors[:10]}

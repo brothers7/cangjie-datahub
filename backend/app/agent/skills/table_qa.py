@@ -105,20 +105,35 @@ async def match_metrics(session, datasource_id, question: str,
 
 async def metric_cards(session, metrics: list[KgMetric]) -> list[dict]:
     """指标口径卡（结构化 payload，前端卡片渲染）：口径/公式/聚合/粒度/单位/可查表。"""
+    if not metrics:
+        return []
+    # 可查表边一次 IN 批量取回：{指标id: [表id]}，替代每指标一次边查询
+    extra_tables: dict[str, list] = {}
+    for e in (await session.execute(
+            select(KgEdge).where(KgEdge.edge_type == EdgeType.METRIC_ON_TABLE,
+                                 KgEdge.src_id.in_([m.id for m in metrics])))).scalars():
+        extra_tables.setdefault(str(e.src_id), []).append(e.dst_id)
+    # 涉及表一次 IN 批量取回，替代逐表 session.get
+    all_tids = {m.table_id for m in metrics if m.table_id}
+    for tids in extra_tables.values():
+        all_tids.update(tids)
+    table_by_id: dict[str, MetaTable] = {}
+    if all_tids:
+        for t in (await session.execute(
+                select(MetaTable).where(MetaTable.id.in_(list(all_tids))))).scalars():
+            table_by_id[str(t.id)] = t
+
     cards: list[dict] = []
     for m in metrics:
         # 可查表：主表 + METRIC_ON_TABLE 边登记的其它表
-        table_ids: list = ([m.table_id] if m.table_id else []) + [
-            e.dst_id for e in (await session.execute(
-                select(KgEdge).where(KgEdge.edge_type == EdgeType.METRIC_ON_TABLE,
-                                     KgEdge.src_id == m.id))).scalars()]
+        table_ids: list = ([m.table_id] if m.table_id else []) + extra_tables.get(str(m.id), [])
         tables: list[dict] = []
         seen: set = set()
         for tid in table_ids:
             if not tid or str(tid) in seen:
                 continue
             seen.add(str(tid))
-            mt = await session.get(MetaTable, tid)
+            mt = table_by_id.get(str(tid))
             if mt is not None:
                 tables.append({"name": mt.table_name, "layer": mt.layer.value,
                                "comment": mt.comment or ""})

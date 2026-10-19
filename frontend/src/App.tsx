@@ -1,21 +1,28 @@
 /** 路由与登录守卫。 */
-import { useEffect } from 'react'
+import { lazy, Suspense, useEffect } from 'react'
 import { Navigate, Route, Routes, useNavigate } from 'react-router-dom'
 import { setUnauthorizedHandler } from '@/api/client'
 import { Spinner } from '@/components/common/ui'
 import MainLayout from '@/layouts/MainLayout'
-import ChatPage from '@/pages/ChatPage'
-import DataSourcesPage from '@/pages/DataSourcesPage'
-import IntegrationsPage from '@/pages/IntegrationsPage'
-import KnowledgeGraphPage from '@/pages/KnowledgeGraphPage'
-import LlmConfigPage from '@/pages/LlmConfigPage'
-import LoginPage from '@/pages/LoginPage'
-import LogsPage from '@/pages/LogsPage'
-import ModelingPage from '@/pages/ModelingPage'
-import GovernancePage from '@/pages/GovernancePage'
-import ReportsPage from '@/pages/ReportsPage'
-import UsersPage from '@/pages/UsersPage'
 import { useAuth } from '@/stores/auth'
+
+// 路由级代码分割：页面（含 ECharts 依赖）按需加载，首屏只拉登录/布局
+const ChatPage = lazy(() => import('@/pages/ChatPage'))
+const DataSourcesPage = lazy(() => import('@/pages/DataSourcesPage'))
+const IntegrationsPage = lazy(() => import('@/pages/IntegrationsPage'))
+const KnowledgeGraphPage = lazy(() => import('@/pages/KnowledgeGraphPage'))
+const LlmConfigPage = lazy(() => import('@/pages/LlmConfigPage'))
+const LoginPage = lazy(() => import('@/pages/LoginPage'))
+const LogsPage = lazy(() => import('@/pages/LogsPage'))
+const ModelingPage = lazy(() => import('@/pages/ModelingPage'))
+const GovernancePage = lazy(() => import('@/pages/GovernancePage'))
+const ReportsPage = lazy(() => import('@/pages/ReportsPage'))
+const UsersPage = lazy(() => import('@/pages/UsersPage'))
+
+/** 路由懒加载兜底：沿用现有加载样式 */
+const routeFallback = (
+  <div className="center" style={{ height: '100vh' }}><Spinner text="加载中…" /></div>
+)
 
 export default function App() {
   const ready = useAuth((s) => s.ready)
@@ -40,10 +47,12 @@ export default function App() {
 
   if (!user) {
     return (
-      <Routes>
-        <Route path="/login" element={<LoginPage />} />
-        <Route path="*" element={<Navigate to="/login" replace />} />
-      </Routes>
+      <Suspense fallback={routeFallback}>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="*" element={<Navigate to="/login" replace />} />
+        </Routes>
+      </Suspense>
     )
   }
 
@@ -52,23 +61,25 @@ export default function App() {
   const adminOnly = (el: React.ReactNode) => (isAdmin ? el : <Navigate to="/chat" replace />)
 
   return (
-    <Routes>
-      <Route path="/login" element={<Navigate to="/chat" replace />} />
-      <Route element={<MainLayout />}>
-        <Route path="/" element={<Navigate to="/chat" replace />} />
-        <Route path="/chat" element={<ChatPage />} />
-        <Route path="/chat/:cid" element={<ChatPage />} />
-        <Route path="/datasources" element={<DataSourcesPage />} />
-        <Route path="/modeling" element={<ModelingPage />} />
-        <Route path="/governance" element={<GovernancePage />} />
-        <Route path="/kg" element={<KnowledgeGraphPage />} />
-        <Route path="/llm" element={adminOnly(<LlmConfigPage />)} />
-        <Route path="/reports" element={<ReportsPage />} />
-        <Route path="/logs" element={<LogsPage />} />
-        <Route path="/users" element={adminOnly(<UsersPage />)} />
-        <Route path="/integrations" element={adminOnly(<IntegrationsPage />)} />
-      </Route>
-      <Route path="*" element={<Navigate to="/chat" replace />} />
-    </Routes>
+    <Suspense fallback={routeFallback}>
+      <Routes>
+        <Route path="/login" element={<Navigate to="/chat" replace />} />
+        <Route element={<MainLayout />}>
+          <Route path="/" element={<Navigate to="/chat" replace />} />
+          <Route path="/chat" element={<ChatPage />} />
+          <Route path="/chat/:cid" element={<ChatPage />} />
+          <Route path="/datasources" element={<DataSourcesPage />} />
+          <Route path="/modeling" element={<ModelingPage />} />
+          <Route path="/governance" element={<GovernancePage />} />
+          <Route path="/kg" element={<KnowledgeGraphPage />} />
+          <Route path="/llm" element={adminOnly(<LlmConfigPage />)} />
+          <Route path="/reports" element={<ReportsPage />} />
+          <Route path="/logs" element={<LogsPage />} />
+          <Route path="/users" element={adminOnly(<UsersPage />)} />
+          <Route path="/integrations" element={adminOnly(<IntegrationsPage />)} />
+        </Route>
+        <Route path="*" element={<Navigate to="/chat" replace />} />
+      </Routes>
+    </Suspense>
   )
 }

@@ -349,7 +349,63 @@ async def get_join_hints(session, table_ids: list[str]) -> list[JoinHint]:
     return hints
 
 
-async def _allowed_dim_ids(session, metric) -> set[str] | None:
+class _GraphCache:
+    """调用级图谱预取缓存（生命周期 = 一次校验/收窄/扩张调用链，随参数传递）。
+
+    约束校验链路里 _allowed_dim_ids 被每个指标反复调用，原先每次都全量加载
+    维度表、逐指标查白名单边与 TABLE_JOIN 邻接，指标多时退化成 3×N 次全表查询。
+    这里把这些只读数据在一次调用链内各查一次：
+      - allowed_map：METRIC_DIM_ALLOWED 边 → {指标id: 白名单维度集合}
+      - join_adj：TABLE_JOIN 边 → {表id: 一跳可达表集合}（双向）
+      - active_dims / dim_by_id：维度表（ACTIVE 子集 / 全量按 id）
+
+    刻意不做跨请求/全局缓存：图谱会被人工编辑，缓存必须随调用结束即失效，
+    宁可每次调用链重新预取，也不引入脏读。
+    """
+
+    def __init__(self) -> None:
+        self._allowed: dict[str, set[str]] | None = None
+        self._adj: dict[str, set[str]] | None = None
+        self._active_dims: list[KgDimension] | None = None
+        self._dim_by_id: dict[str, KgDimension] | None = None
+
+    async def allowed_map(self, session) -> dict[str, set[str]]:
+        if self._allowed is None:
+            m: dict[str, set[str]] = {}
+            for src, dst in (await session.execute(
+                    select(KgEdge.src_id, KgEdge.dst_id).where(
+                        KgEdge.edge_type == EdgeType.METRIC_DIM_ALLOWED,
+                        KgEdge.src_type == EntityType.METRIC))).all():
+                m.setdefault(str(src), set()).add(str(dst))
+            self._allowed = m
+        return self._allowed
+
+    async def join_adj(self, session) -> dict[str, set[str]]:
+        if self._adj is None:
+            adj: dict[str, set[str]] = {}
+            for src, dst in (await session.execute(
+                    select(KgEdge.src_id, KgEdge.dst_id).where(
+                        KgEdge.edge_type == EdgeType.TABLE_JOIN))).all():
+                adj.setdefault(str(src), set()).add(str(dst))
+                adj.setdefault(str(dst), set()).add(str(src))
+            self._adj = adj
+        return self._adj
+
+    async def active_dims(self, session) -> list[KgDimension]:
+        if self._active_dims is None:
+            self._active_dims = list((await session.execute(
+                select(KgDimension).where(KgDimension.status == MetricStatus.ACTIVE))).scalars())
+        return self._active_dims
+
+    async def dim_by_id(self, session) -> dict[str, KgDimension]:
+        """全量维度按 id（不限状态，与 get_dimension_details 同一判据）。"""
+        if self._dim_by_id is None:
+            self._dim_by_id = {str(d.id): d for d in (await session.execute(
+                select(KgDimension))).scalars()}
+        return self._dim_by_id
+
+
+async def _allowed_dim_ids(session, metric, cache: _GraphCache | None = None) -> set[str] | None:
     """指标可用的维度集合。返回 None 表示未登记白名单（不做约束校验）。
 
     同表共现（METRIC_DIM_ALLOWED）只是白名单的一半：星型/雪花模型里
@@ -357,22 +413,18 @@ async def _allowed_dim_ids(session, metric) -> set[str] | None:
     但两者可以 JOIN。若只认同表共现，所有跨表维度组合都会被拦死。
     因此这里把指标表 ``TABLE_JOIN`` 一跳可达的表上的维度也算作可用。
     """
-    edges = (await session.execute(
-        select(KgEdge).where(KgEdge.edge_type == EdgeType.METRIC_DIM_ALLOWED,
-                             KgEdge.src_type == EntityType.METRIC, KgEdge.src_id == metric.id)
-    )).scalars().all()
-    if not edges:
+    cache = cache or _GraphCache()
+    amap = await cache.allowed_map(session)
+    if str(metric.id) not in amap:
         return None
-    allowed = {str(e.dst_id) for e in edges}
+    allowed = set(amap[str(metric.id)])
     if metric.table_id is None:
         return allowed
-    reach = (await _join_reachable_tables(session, [str(metric.table_id)])).get(
-        str(metric.table_id), set())
+    reach = (await cache.join_adj(session)).get(str(metric.table_id), set())
     if not reach:
         return allowed
     # 可达维表上的维度：以 related_columns 为准（与 resolve_tables 的维度可用性同一判据）
-    for d in (await session.execute(
-            select(KgDimension).where(KgDimension.status == MetricStatus.ACTIVE))).scalars():
+    for d in await cache.active_dims(session):
         if str(d.id) in allowed:
             continue
         if any(rel.get("table_id") in reach for rel in (d.related_columns or [])):
@@ -399,10 +451,11 @@ async def expand_metric_siblings(session, metrics: list[KgMetric],
     """
     if not metrics or not dims:
         return list(metrics)
+    cache = _GraphCache()
     dim_ids = {str(d.id) for d in dims}
     stems: set[str] = set()
     for m in metrics:
-        if await _metric_serves_dims(session, m, dim_ids):
+        if await _metric_serves_dims(session, m, dim_ids, cache):
             continue
         stems.add(metric_stem(m.name))
     if not stems:
@@ -414,26 +467,31 @@ async def expand_metric_siblings(session, metrics: list[KgMetric],
             select(KgMetric).where(KgMetric.status == MetricStatus.ACTIVE))).scalars():
         if str(cand.id) in have or metric_stem(cand.name) not in stems:
             continue
-        if not await _metric_serves_dims(session, cand, dim_ids):
+        if not await _metric_serves_dims(session, cand, dim_ids, cache):
             continue
         out.append(cand)
         have.add(str(cand.id))
     return out
 
 
-async def _metric_serves_dims(session, metric: KgMetric, dim_ids: set[str]) -> bool:
+async def _metric_serves_dims(session, metric: KgMetric, dim_ids: set[str],
+                              cache: _GraphCache | None = None) -> bool:
     """指标能否满足这些维度：白名单放行 ∧ 其表本身或可 JOIN 的表能给出维度列。
 
     dim_ids 为空（时点类问题）时只看白名单。
     """
-    allowed = await _allowed_dim_ids(session, metric)
+    cache = cache or _GraphCache()
+    allowed = await _allowed_dim_ids(session, metric, cache)
     if allowed is not None and not dim_ids.issubset(allowed):
         return False
     if not dim_ids or metric.table_id is None:
         return True
-    reach = (await _join_reachable_tables(session, [str(metric.table_id)])).get(
-        str(metric.table_id), set()) | {str(metric.table_id)}
-    for d in await get_dimension_details(session, list(dim_ids)):
+    reach = (await cache.join_adj(session)).get(str(metric.table_id), set()) | {str(metric.table_id)}
+    by_id = await cache.dim_by_id(session)
+    for did in dim_ids:
+        d = by_id.get(did)
+        if d is None:
+            continue  # 维度已删除/不存在：与原 get_dimension_details 查不到即跳过一致
         if not any(r.get("table_id") in reach for r in (d.related_columns or [])):
             return False
     return True
@@ -455,16 +513,17 @@ async def filter_metrics_for_dims(session, metrics: list[KgMetric],
     """
     if not metrics or not dims:
         return list(metrics), []
+    cache = _GraphCache()
     dim_ids = {str(d.id) for d in dims}
     strict = await _graph_has_joins(session, metrics)
     kept: list[KgMetric] = []
     dropped: list[KgMetric] = []
     unreachable: list[KgMetric] = []
     for m in metrics:
-        allowed = await _allowed_dim_ids(session, m)
+        allowed = await _allowed_dim_ids(session, m, cache)
         if allowed is not None and not dim_ids.issubset(allowed):
             dropped.append(m)
-        elif await _metric_serves_dims(session, m, dim_ids):
+        elif await _metric_serves_dims(session, m, dim_ids, cache):
             kept.append(m)
         else:
             unreachable.append(m)
@@ -529,21 +588,26 @@ async def check_constraints(session, metrics: list[KgMetric],
             sev = "block" if r.severity == RuleSeverity.BLOCK else "warn"
             out.append(Violation(sev, r.message or f"维度组合 [{'/'.join(combo)}] 禁止一起使用", "forbidden_dim_combo"))
 
-    # 2) 指标×维度 FORBIDDEN 边
-    for m in metrics:
-        forbidden = (await session.execute(
-            select(KgEdge).where(KgEdge.edge_type == EdgeType.METRIC_DIM_FORBIDDEN,
-                                 KgEdge.src_type == EntityType.METRIC, KgEdge.src_id == m.id)
-        )).scalars().all()
-        for e in forbidden:
-            if str(e.dst_id) in dim_ids:
-                out.append(Violation("block", f"指标「{m.name}」不支持按该维度拆分（图谱约束）",
-                                    "metric_dim_forbidden"))
+    # 2) 指标×维度 FORBIDDEN 边（一次 IN 批量查询，按指标分组，替代每指标一次查询）
+    if metrics:
+        forbid_by_metric: dict[str, list[str]] = {}
+        for src, dst in (await session.execute(
+                select(KgEdge.src_id, KgEdge.dst_id).where(
+                    KgEdge.edge_type == EdgeType.METRIC_DIM_FORBIDDEN,
+                    KgEdge.src_type == EntityType.METRIC,
+                    KgEdge.src_id.in_([m.id for m in metrics])))).all():
+            forbid_by_metric.setdefault(str(src), []).append(str(dst))
+        for m in metrics:
+            for dst in forbid_by_metric.get(str(m.id), []):
+                if dst in dim_ids:
+                    out.append(Violation("block", f"指标「{m.name}」不支持按该维度拆分（图谱约束）",
+                                        "metric_dim_forbidden"))
 
     # 3) 维度不在指标允许集合内（存在 ALLOWED 边时白名单校验）
     #    允许集合含「可 JOIN 的维表上的维度」，见 _allowed_dim_ids
+    cache = _GraphCache()
     for m in metrics:
-        allowed = await _allowed_dim_ids(session, m)
+        allowed = await _allowed_dim_ids(session, m, cache)
         if allowed is None:
             continue
         for d in dims:
@@ -565,7 +629,7 @@ async def check_constraints(session, metrics: list[KgMetric],
     #    拦下来只会让人看不到任何结果，不如放行后由 SQL 阶段报错。
     if dims and len(metrics) > 1:
         for m in metrics:
-            if not await _metric_serves_dims(session, m, dim_ids):
+            if not await _metric_serves_dims(session, m, dim_ids, cache):
                 out.append(Violation(
                     "block",
                     f"指标「{m.name}」所在表既没有「{'/'.join(dim_names)}」维度列，"

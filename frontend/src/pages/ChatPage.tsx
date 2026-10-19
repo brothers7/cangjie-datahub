@@ -1,5 +1,5 @@
 /** 对话问答页：多轮会话 + SSE 实时过程 + 图表 + 报表。 */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { api, ApiError } from '@/api/client'
 import { payloadToView, streamAsk, type AskView } from '@/api/sse'
@@ -9,7 +9,7 @@ import { MetricCards } from '@/components/chat/MetricCards'
 import { StepTimeline, type StepState } from '@/components/chat/StepTimeline'
 import { SqlPanel } from '@/components/chat/SqlPanel'
 import { Markdown } from '@/components/common/Markdown'
-import { Empty, relTime, Spinner } from '@/components/common/ui'
+import { Confirm, Empty, relTime, Spinner } from '@/components/common/ui'
 import { useI18n } from '@/i18n'
 import { useApp, toast } from '@/stores/app'
 import type { Conversation, EtlDesignResult, LlmChatOption, MessageRow, MetricCard, ReportDetail } from '@/types'
@@ -50,6 +50,9 @@ const SUGGESTION_KEYS = [
   'chat.suggest5', 'chat.suggest6', 'chat.suggest7',
 ]
 
+/** 记住用户上次使用的数据源，新建会话时优先沿用 */
+const LAST_DS_KEY = 'chat.lastDatasourceId'
+
 export default function ChatPage() {
   const { t } = useI18n()
   const { cid } = useParams<{ cid?: string }>()
@@ -64,8 +67,15 @@ export default function ChatPage() {
   const [loading, setLoading] = useState(false)
   const [report, setReport] = useState<ReportDetail | null>(null)
   const [llmOptions, setLlmOptions] = useState<LlmChatOption[]>([])
+  const [delConv, setDelConv] = useState<string | null>(null)
   const abortRef = useRef<(() => void) | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const stickRef = useRef(true)                    // 用户是否停留在底部附近（决定是否跟随滚动）
+  const msgReqRef = useRef(0)                      // 历史消息请求序号，防止快速切换时旧响应覆盖新会话
+  const tokenBufRef = useRef('')                   // 流式 token 节流缓冲
+  const tokenTimerRef = useRef<number | null>(null)
+  const pendingSendRef = useRef<string | null>(null)  // 新建会话后待自动发送的问题
+  const mountedRef = useRef(true)
 
   const activeConv = useMemo(() => convs.find((c) => c.id === cid) || null, [convs, cid])
   const busy = live?.running === true
@@ -80,13 +90,24 @@ export default function ChatPage() {
   }, [])
 
   const loadMessages = useCallback(async (id: string) => {
+    const req = ++msgReqRef.current
     setLoading(true)
     try {
-      setMessages(await api.listMessages(id))
+      const rows = await api.listMessages(id)
+      // 竞态守卫：响应返回时若已有更新的请求，丢弃旧结果
+      if (req === msgReqRef.current) setMessages(rows)
     } catch (e) {
-      toast.error((e as ApiError).message)
+      if (req === msgReqRef.current) toast.error((e as ApiError).message)
     } finally {
-      setLoading(false)
+      if (req === msgReqRef.current) setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      if (tokenTimerRef.current != null) window.clearTimeout(tokenTimerRef.current)
     }
   }, [])
 
@@ -102,20 +123,36 @@ export default function ChatPage() {
     else setMessages([])
   }, [cid, loadMessages])
 
-  // 自动滚动
+  // 记住当前会话的数据源，供下次新建会话沿用
+  const activeDsId = activeConv?.datasource_id
+  useEffect(() => {
+    if (activeDsId) {
+      try { localStorage.setItem(LAST_DS_KEY, activeDsId) } catch { /* ignore */ }
+    }
+  }, [activeDsId])
+
+  // 智能跟随滚动：仅当用户本来就在底部附近时才自动滚到底
   useEffect(() => {
     const el = scrollRef.current
-    if (el) el.scrollTop = el.scrollHeight
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight
   }, [messages, live?.answer, live?.steps.length])
 
   // ---- 新建 / 删除会话 ----
-  const newConversation = async () => {
+  const newConversation = async (firstQuestion?: string) => {
     if (busy) return
-    const ds = datasources[0]
+    // 优先沿用上次使用的数据源，没有（或已失效）再退回第一个
+    let lastDs: string | null = null
+    try { lastDs = localStorage.getItem(LAST_DS_KEY) } catch { /* ignore */ }
+    const ds = datasources.find((d) => d.id === lastDs) ?? datasources[0]
     const defaultLlm = llmOptions.find((o) => o.is_default) ?? llmOptions[0]
     try {
       const c = await api.createConversation(t('chat.newConversationTitle'), ds?.id ?? null, defaultLlm?.id ?? null)
+      if (!mountedRef.current) return  // 竞态守卫：等待期间页面已卸载则不再跳转
+      if (ds?.id) { try { localStorage.setItem(LAST_DS_KEY, ds.id) } catch { /* ignore */ } }
       await loadConvs()
+      if (!mountedRef.current) return
+      // 有点建议词直达提问的场景：暂存问题，待路由切换落地后由 effect 发送
+      pendingSendRef.current = firstQuestion ?? null
       nav(`/chat/${c.id}`)
     } catch (e) {
       toast.error((e as ApiError).message)
@@ -134,10 +171,8 @@ export default function ChatPage() {
     }
   }
 
-  const removeConversation = async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation()
-    if (busy) return
-    if (!window.confirm(t('chat.confirmDeleteConv'))) return
+  const removeConversation = async (id: string) => {
+    setDelConv(null)
     try {
       await api.deleteConversation(id)
       if (id === cid) nav('/chat')
@@ -148,17 +183,30 @@ export default function ChatPage() {
   }
 
   // ---- 发送 ----
-  const send = (question: string, confirm?: Record<string, unknown> | null) => {
+  // 把节流缓冲中的 token 一次性刷进 state
+  const flushLiveTokens = useCallback(() => {
+    tokenTimerRef.current = null
+    const pending = tokenBufRef.current
+    if (!pending) return
+    tokenBufRef.current = ''
+    setLive((s) => s && ({ ...s, answer: s.answer + pending }))
+  }, [])
+
+  const send = useCallback((question: string, confirm?: Record<string, unknown> | null) => {
     const q = question.trim()
     if (!q || !cid) return
     if (busy) { toast.warn(t('chat.busyWarn')); return }
 
+    msgReqRef.current++  // 作废旧的历史加载，避免覆盖刚追加的本地消息
+    stickRef.current = true  // 自己发问时强制吸底
     setInput('')
     setMessages((prev) => [...prev, {
       id: `local-${Date.now()}`, role: 'user', content: q, payload: null,
       created_at: new Date().toISOString(),
     }])
     setLive({ ...emptyLive(), running: true })
+    tokenBufRef.current = ''
+    if (tokenTimerRef.current != null) { window.clearTimeout(tokenTimerRef.current); tokenTimerRef.current = null }
 
     abortRef.current = streamAsk(cid, q, {
       onMeta: () => undefined,
@@ -175,7 +223,11 @@ export default function ChatPage() {
         ...s, metrics: d.metrics, dimensions: d.dimensions, timeRange: d.time_range, note: d.note || '',
       })),
       onSql: (d) => setLive((s) => s && ({ ...s, sql: d.sql, tables: d.tables, dialect: d.dialect, guarded: d.guarded })),
-      onToken: (t) => setLive((s) => s && ({ ...s, answer: s.answer + t })),
+      // ref 累积 + 50ms 节流刷 state，避免每个 token 触发全量重渲染
+      onToken: (tok) => {
+        tokenBufRef.current += tok
+        if (tokenTimerRef.current == null) tokenTimerRef.current = window.setTimeout(flushLiveTokens, 50)
+      },
       onChart: (d) => setLive((s) => s && ({ ...s, chartSpec: d.chart_spec })),
       onReport: (d) => setLive((s) => s && ({ ...s, reportId: d.report_id, reportSections: d.sections })),
       onEtl: (d) => setLive((s) => s && ({ ...s, etl: d })),
@@ -183,27 +235,43 @@ export default function ChatPage() {
       onConfirmRequired: (d) => setLive((s) => s && ({ ...s, candidates: d.candidates })),
       onError: (d) => setLive((s) => s && ({ ...s, error: d.message })),
       onDone: async (d) => {
+        if (tokenTimerRef.current != null) { window.clearTimeout(tokenTimerRef.current); tokenTimerRef.current = null }
+        flushLiveTokens()
         setLive((s) => s && ({ ...s, running: false, error: d.error || s.error }))
-        if (d.error) toast.error(d.error)
+        if (d.error) toast.error(d.error === 'closed' ? t('chat.streamClosed') : d.error)
         // 拉取落库版本（含报表 ID、完整 payload）
         await loadMessages(cid)
         await loadConvs()
         setLive(null)
       },
     }, confirm)
-  }
+  }, [cid, busy, t, loadMessages, loadConvs, flushLiveTokens])
+
+  // 新建会话直达提问：路由切换落地后自动发送暂存的问题（须放在清场 effect 之后声明）
+  useEffect(() => {
+    if (!cid || !pendingSendRef.current) return
+    const q = pendingSendRef.current
+    pendingSendRef.current = null
+    send(q)
+  }, [cid, send])
 
   const stop = async () => {
     abortRef.current?.()
+    if (tokenTimerRef.current != null) { window.clearTimeout(tokenTimerRef.current); tokenTimerRef.current = null }
+    flushLiveTokens()
     if (cid) { try { await api.cancelMessage(cid) } catch { /* ignore */ } }
     setLive((s) => s && ({ ...s, running: false, error: t('chat.stopped') }))
     if (cid) await loadMessages(cid)
     setLive(null)
   }
 
-  const openReport = async (id: string) => {
+  const openReport = useCallback(async (id: string) => {
     try { setReport(await api.getReport(id)) } catch (e) { toast.error((e as ApiError).message) }
-  }
+  }, [])
+
+  // 稳定回调，配合 memo 后的 MessageBubble 避免历史气泡随流式输出重渲染
+  const handleOpenReport = useCallback((id: string) => { void openReport(id) }, [openReport])
+  const handleConfirm = useCallback((q: string, mid: string) => send(q, { metric_id: mid }), [send])
 
   return (
     <div className="chat">
@@ -224,7 +292,7 @@ export default function ChatPage() {
                 <div className="d">{t('chat.msgCount', { n: c.message_count })} · {relTime(c.last_active_at || c.created_at, t)}</div>
               </div>
               <button className="btn ghost sm" title={t('common.delete')}
-                onClick={(e) => void removeConversation(c.id, e)}>✕</button>
+                onClick={(e) => { e.stopPropagation(); if (!busy) setDelConv(c.id) }}>✕</button>
             </div>
           ))}
         </div>
@@ -259,7 +327,11 @@ export default function ChatPage() {
             )}
           </div>
         )}
-        <div className="msg-scroll" ref={scrollRef}>
+        <div className="msg-scroll" ref={scrollRef}
+          onScroll={(e) => {
+            const el = e.currentTarget
+            stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+          }}>
           <div className="msg-wrap">
             {!cid && (
               <Empty icon="💬" text={t('chat.emptySelect')} />
@@ -269,8 +341,8 @@ export default function ChatPage() {
             )}
 
             {messages.map((m) => (
-              <MessageBubble key={m.id} msg={m} onOpenReport={(id) => void openReport(id)}
-                onConfirm={(q, mid) => send(q, { metric_id: mid })} />
+              <MessageBubble key={m.id} msg={m} onOpenReport={handleOpenReport}
+                onConfirm={handleConfirm} />
             ))}
 
             {live && (
@@ -312,7 +384,8 @@ export default function ChatPage() {
             <div className="suggest">
               {SUGGESTION_KEYS.map((k) => {
                 const s = t(k)
-                return <button key={k} onClick={() => (cid ? send(s) : void newConversation())}>{s}</button>
+                // 无会话时先建会话，拿到 id 落地后自动发送该问题
+                return <button key={k} onClick={() => (cid ? send(s) : void newConversation(s))}>{s}</button>
               })}
             </div>
           )}
@@ -323,7 +396,8 @@ export default function ChatPage() {
               disabled={!cid}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(input) }
+                // isComposing：中文输入法选词时的 Enter 不触发发送
+                if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(input) }
               }}
             />
             {busy
@@ -333,6 +407,12 @@ export default function ChatPage() {
         </div>
       </div>
 
+      {delConv && (
+        <Confirm danger title={t('common.delete')} okText={t('common.delete')}
+          text={t('chat.confirmDeleteConv')}
+          onCancel={() => setDelConv(null)}
+          onOk={() => void removeConversation(delConv)} />
+      )}
       {report && (
         <Drawer title={report.title} sub={`${t('chat.reportViews', { n: report.view_count })} · ${relTime(report.created_at, t)}`}
           onClose={() => setReport(null)}>
@@ -364,13 +444,14 @@ function ConfirmPrompt({ candidates, onPick }: {
   )
 }
 
-function MessageBubble({ msg, onOpenReport, onConfirm }: {
+// memo + useMemo：流式输出期间历史气泡不随每个 token 重渲染、Markdown 不重复解析
+const MessageBubble = memo(function MessageBubble({ msg, onOpenReport, onConfirm }: {
   msg: MessageRow
   onOpenReport: (id: string) => void
   onConfirm: (q: string, metricId: string) => void
 }) {
   const { t, lang } = useI18n()
-  const view = payloadToView(msg.payload)
+  const view = useMemo(() => payloadToView(msg.payload), [msg.payload])
 
   if (msg.role === 'user') {
     return <div className="msg user"><div className="bubble">{msg.content}</div></div>
@@ -451,4 +532,4 @@ function MessageBubble({ msg, onOpenReport, onConfirm }: {
       </div>
     </div>
   )
-}
+})

@@ -4,6 +4,7 @@ import { api, ApiError } from '@/api/client'
 import { Markdown } from '@/components/common/Markdown'
 import { Confirm, Drawer, Empty, Pager, relTime, Spinner, Tabs } from '@/components/common/ui'
 import { useI18n } from '@/i18n'
+import { useDebouncedValue } from '@/hooks/useDebouncedValue'
 import { toast } from '@/stores/app'
 import type { ReportDetail, ReportRow } from '@/types'
 
@@ -15,6 +16,7 @@ export default function ReportsPage() {
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [q, setQ] = useState('')
+  const dq = useDebouncedValue(q)  // 搜索防抖后再进 load 依赖
   const [loading, setLoading] = useState(true)
   const [detail, setDetail] = useState<ReportDetail | null>(null)
   const [confirmDel, setConfirmDel] = useState<ReportRow | null>(null)
@@ -23,7 +25,7 @@ export default function ReportsPage() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const r = await api.listReports({ q: q || undefined, page, page_size: pageSize })
+      const r = await api.listReports({ q: dq || undefined, page, page_size: pageSize })
       setRows(r.rows)
       setTotal(r.total)
     } catch (e) {
@@ -31,7 +33,7 @@ export default function ReportsPage() {
     } finally {
       setLoading(false)
     }
-  }, [q, page])
+  }, [dq, page])
 
   useEffect(() => { if (tab === 'reports') void load() }, [tab, load])
 

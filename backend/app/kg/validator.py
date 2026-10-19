@@ -72,13 +72,14 @@ async def run_validation(session, datasource_id: uuid.UUID | None = None) -> lis
     forbidden = (await session.execute(
         select(KgEdge).where(KgEdge.edge_type == EdgeType.METRIC_DIM_FORBIDDEN)
     )).scalars().all()
+    # ALLOWED 边一次性取成 (指标id, 维度id) 集合做内存比对，替代每条 FORBIDDEN 边一次冲突查询
+    allowed_pairs = {(str(src), str(dst)) for src, dst in (await session.execute(
+        select(KgEdge.src_id, KgEdge.dst_id).where(
+            KgEdge.edge_type == EdgeType.METRIC_DIM_ALLOWED,
+            KgEdge.src_type == EntityType.METRIC,
+            KgEdge.dst_type == EntityType.DIMENSION))).all()}
     for e in forbidden:
-        conflict = (await session.execute(
-            select(KgEdge).where(KgEdge.edge_type == EdgeType.METRIC_DIM_ALLOWED,
-                                 KgEdge.src_type == EntityType.METRIC, KgEdge.src_id == e.src_id,
-                                 KgEdge.dst_type == EntityType.DIMENSION, KgEdge.dst_id == e.dst_id)
-        )).scalar_one_or_none()
-        if conflict:
+        if (str(e.src_id), str(e.dst_id)) in allowed_pairs:
             issues.append({
                 "category": "conflict_dim_rule", "severity": "error",
                 "entity_type": "metric", "entity_id": str(e.src_id), "entity_name": "",
@@ -115,16 +116,23 @@ async def _check_unreachable_combos(session, metrics: list[KgMetric]) -> list[di
     from app.kg import service as kg_service  # 延迟导入：service 不依赖 validator，此处仅为避免顶层耦合
 
     out: list[dict] = []
+    # 调用级图谱缓存：白名单边 / TABLE_JOIN 邻接 / 维度表各查一次，
+    # 替代每指标（甚至每指标×每维度）一轮全量查询
+    cache = kg_service._GraphCache()
+    by_id = await cache.dim_by_id(session)
     for m in metrics:
-        allowed = await kg_service._allowed_dim_ids(session, m)
+        allowed = await kg_service._allowed_dim_ids(session, m, cache)
         if not allowed:
             continue
-        if await kg_service._metric_serves_dims(session, m, set(allowed)):
+        if await kg_service._metric_serves_dims(session, m, set(allowed), cache):
             continue
         # 定位到底哪些维度够不着，报错信息要能直接指到维度名
         unreachable = []
-        for d in await kg_service.get_dimension_details(session, list(allowed)):
-            if not await kg_service._metric_serves_dims(session, m, {str(d.id)}):
+        for did in allowed:
+            d = by_id.get(did)
+            if d is None:
+                continue
+            if not await kg_service._metric_serves_dims(session, m, {did}, cache):
                 unreachable.append(d.name)
         if not unreachable:
             continue

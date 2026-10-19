@@ -159,10 +159,10 @@ async def _source_context(session, sources: list[dict], datasource_id) -> str:
     tables = (await session.execute(
         select(MetaTable).where(MetaTable.datasource_id == datasource_id,
                                 MetaTable.table_name.in_(names)))).scalars().all()
+    cols_by_id = await columns_by_table(session, [t.id for t in tables])
     parts: list[str] = []
     for t in tables:
-        cols = (await session.execute(
-            select(MetaColumn).where(MetaColumn.table_id == t.id))).scalars().all()
+        cols = cols_by_id.get(str(t.id), [])
         head = f"### {t.table_name}（{t.layer.value} 层，{t.comment or '暂无注释'}"
         if t.partition_cols:
             head += f"，分区: {','.join(t.partition_cols[:3])}"
@@ -376,16 +376,23 @@ def _apply_draft(design: EtlDesign, data: dict) -> None:
     design.notes = str(data.get("notes") or "").strip()
 
 
+async def columns_by_table(session, table_ids: list) -> dict[str, list[MetaColumn]]:
+    """批量取多表字段：{str(table_id): [MetaColumn]}，一次 IN 查询替代逐表查询。"""
+    out: dict[str, list[MetaColumn]] = {str(t): [] for t in table_ids}
+    if not table_ids:
+        return out
+    for c in (await session.execute(
+            select(MetaColumn).where(MetaColumn.table_id.in_(list(table_ids))))).scalars():
+        out.setdefault(str(c.table_id), []).append(c)
+    return out
+
+
 async def _table_columns(session, datasource_id, extra_names: list[str]) -> dict[str, set[str]]:
     """{表名: 字段集合}，供 sqlglot 引用校验。"""
     tables = (await session.execute(
         select(MetaTable).where(MetaTable.datasource_id == datasource_id))).scalars().all()
-    out: dict[str, set[str]] = {}
-    for t in tables:
-        cols = (await session.execute(
-            select(MetaColumn.column_name).where(MetaColumn.table_id == t.id))).scalars().all()
-        out[t.table_name] = set(cols)
-    return out
+    by_id = await columns_by_table(session, [t.id for t in tables])
+    return {t.table_name: {c.column_name for c in by_id.get(str(t.id), [])} for t in tables}
 
 
 @skill("etl_design", "基于元数据的 ETL 需求开发子 Agent（仅生成，不执行）")

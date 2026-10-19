@@ -1,5 +1,5 @@
 /** ECharts 容器：按需引入 + resize 自适应 + 主题色跟随 CSS 变量。 */
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import * as echarts from 'echarts/core'
 import { BarChart, LineChart, PieChart } from 'echarts/charts'
 import {
@@ -18,9 +18,22 @@ echarts.use([
   CanvasRenderer,
 ])
 
+/** 订阅系统亮/暗色切换：返回递增 tick，供 option 的 useMemo 依赖触发主题色重建 */
+export function useThemeTick(): number {
+  const [tick, setTick] = useState(0)
+  useEffect(() => {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)')
+    const onChange = () => setTick((n) => n + 1)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+  return tick
+}
+
 export function Chart({ option, height = 300 }: { option: EChartsOption; height?: number }) {
   const ref = useRef<HTMLDivElement>(null)
   const inst = useRef<ChartInstance | null>(null)
+  const themeTick = useThemeTick()
 
   useEffect(() => {
     if (!ref.current) return
@@ -35,9 +48,10 @@ export function Chart({ option, height = 300 }: { option: EChartsOption; height?
     }
   }, [])
 
+  // themeTick 进依赖：系统主题切换时强制 setOption 重建（option 内烤入的 CSS 变量色随之刷新）
   useEffect(() => {
     inst.current?.setOption(option, true)
-  }, [option])
+  }, [option, themeTick])
 
   return <div ref={ref} style={{ width: '100%', height }} />
 }

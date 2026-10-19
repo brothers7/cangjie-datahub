@@ -110,6 +110,14 @@ class Connector(ABC):
         """执行查询前的会话级只读/超时设置。"""
         return []
 
+    def _quote_ident(self, name: str) -> str:
+        """标识符引用：默认双引号（SQL 标准）。
+
+        MySQL 系方言（mysql/doris/starrocks）默认 sql_mode 下双引号是字符串常量，
+        `COUNT(DISTINCT "col")` 会退化成对常量计数（恒为 1），子类覆盖为反引号。
+        """
+        return '"' + name.replace('"', '""') + '"'
+
     def _readonly_statements(self) -> list[str]:
         """会话级只读设置：仅当数据源开启「强制只读会话」时下发（PRD 4.4）。"""
         return []
@@ -242,7 +250,8 @@ class Connector(ABC):
         try:
             with self.engine().connect() as conn:
                 if self.db_type == DbType.SQLITE:
-                    return conn.execute(sa.text(f'SELECT COUNT(*) FROM "{name}"')).scalar()
+                    return conn.execute(
+                        sa.text(f"SELECT COUNT(*) FROM {self._quote_ident(name)}")).scalar()
                 return None
         except Exception:
             return None
@@ -276,10 +285,11 @@ class Connector(ABC):
             stats: dict[str, dict] = {}
             if not columns:
                 return stats
-            qcols = ", ".join(f'"{c}"' for c in columns)
-            sub = f'SELECT {qcols} FROM "{table}" LIMIT {int(sample_rows)}'
+            qcols = ", ".join(self._quote_ident(c) for c in columns)
+            sub = f"SELECT {qcols} FROM {self._quote_ident(table)} LIMIT {int(sample_rows)}"
             select_expr = ", ".join(
-                f'COUNT(DISTINCT "{c}") AS d_{i}, COUNT("{c}") AS n_{i}' for i, c in enumerate(columns)
+                f"COUNT(DISTINCT {self._quote_ident(c)}) AS d_{i}, "
+                f"COUNT({self._quote_ident(c)}) AS n_{i}" for i, c in enumerate(columns)
             )
             with self.engine().connect() as conn:
                 row = conn.execute(sa.text(f"SELECT {select_expr} FROM ({sub})")).mappings().first()
@@ -289,8 +299,9 @@ class Connector(ABC):
                     non_null = rowd.get(f"n_{i}")
                     examples: list = []
                     try:
+                        qc = self._quote_ident(c)
                         ex = conn.execute(sa.text(
-                            f'SELECT DISTINCT "{c}" FROM ({sub}) WHERE "{c}" IS NOT NULL LIMIT 15'
+                            f"SELECT DISTINCT {qc} FROM ({sub}) WHERE {qc} IS NOT NULL LIMIT 15"
                         )).scalars().all()
                         examples = [jsonify_value(x) for x in ex]
                     except Exception:

@@ -20,6 +20,11 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 MAX_LOGIN_FAILS = 5
 LOCK_MINUTES = 10
 
+# 时序防枚举：不存在的账号也执行一次 argon2 校验（对预生成的假 hash），
+# 使响应耗时不泄露账号是否存在。该 hash 不对应任何真实账号。
+_DUMMY_HASH = ("$argon2id$v=19$m=65536,t=3,p=4$MonXBSkoeJc0Y7TJWeoGbg$"
+               "mdc3rsG6q30M06jYSFL5Wn5X8OyQjMTWGKeRHaQnvXk")
+
 
 @router.post("/login", response_model=TokenOut)
 async def login(body: LoginIn, request: Request, db: AsyncSession = Depends(get_db)):
@@ -30,17 +35,20 @@ async def login(body: LoginIn, request: Request, db: AsyncSession = Depends(get_
     if user is not None and user.locked_until and user.locked_until > now:
         remain = int((user.locked_until - now).total_seconds() // 60) + 1
         raise AuthError(f"登录失败次数过多，账号已锁定，请约 {remain} 分钟后重试")
-    if user is None or not verify_password(body.password, user.password_hash):
-        if user is not None:
-            # 失败计数入库（必须提交，否则限流无效）；不存在的账号不计数，避免用户名探测差异
-            user.failed_login_count = (user.failed_login_count or 0) + 1
-            locked_now = user.failed_login_count >= MAX_LOGIN_FAILS
-            if locked_now:
-                user.failed_login_count = 0
-                user.locked_until = now + timedelta(minutes=LOCK_MINUTES)
-            db.add(AuditLog(user_id=user.id, username=user.username, action="login_failed",
-                            ip=ip, detail={"locked": locked_now}))
-            await db.commit()
+    if user is None:
+        # dummy 校验拉平耗时；不存在的账号不计入锁定计数（保持既有行为）
+        verify_password(body.password, _DUMMY_HASH)
+        raise AuthError("用户名或密码错误")
+    if not verify_password(body.password, user.password_hash):
+        # 失败计数入库（必须提交，否则限流无效）
+        user.failed_login_count = (user.failed_login_count or 0) + 1
+        locked_now = user.failed_login_count >= MAX_LOGIN_FAILS
+        if locked_now:
+            user.failed_login_count = 0
+            user.locked_until = now + timedelta(minutes=LOCK_MINUTES)
+        db.add(AuditLog(user_id=user.id, username=user.username, action="login_failed",
+                        ip=ip, detail={"locked": locked_now}))
+        await db.commit()
         raise AuthError("用户名或密码错误")
     if user.status != UserStatus.ACTIVE:
         raise AuthError("账号已禁用")

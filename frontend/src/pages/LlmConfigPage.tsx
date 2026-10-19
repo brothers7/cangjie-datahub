@@ -1,8 +1,9 @@
 /** LLM 配置：多模型接入（OpenAI / Anthropic）、健康检查、默认模型切换、场景绑定、用量与调用日志。 */
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, ApiError } from '@/api/client'
-import { Chart } from '@/components/charts/Chart'
-import { Confirm, Empty, Field, Modal, Pager, Spinner, StatusTag, Tabs } from '@/components/common/ui'
+import { CATEGORICAL, Chart, themeColors, useThemeTick } from '@/components/charts/Chart'
+import { Confirm, Empty, Field, Modal, Spinner, StatusTag, Tabs } from '@/components/common/ui'
+import { LlmLogsTable } from '@/components/logs/LlmLogsTable'
 import { useI18n } from '@/i18n'
 import { sceneLabels } from '@/labels'
 import { toast } from '@/stores/app'
@@ -268,17 +269,50 @@ function UsagePanel() {
     { input: 0, output: 0, calls: 0, errors: 0 },
   ), [rows])
 
-  const option = useMemo(() => ({
-    tooltip: { trigger: 'axis' as const },
-    legend: { data: [t('admin.llm.inputTokens'), t('admin.llm.outputTokens')] },
-    grid: { left: 60, right: 24, top: 40, bottom: 40 },
-    xAxis: { type: 'category' as const, data: rows.map((r) => r.key), axisLabel: { fontSize: 10 } },
-    yAxis: { type: 'value' as const },
-    series: [
-      { name: t('admin.llm.inputTokens'), type: 'bar' as const, stack: 't', data: rows.map((r) => r.input_tokens) },
-      { name: t('admin.llm.outputTokens'), type: 'bar' as const, stack: 't', data: rows.map((r) => r.output_tokens) },
-    ],
-  }), [rows, t])
+  // 主题 CSS 变量随系统亮/暗切换：tick 变化时重建 option（与 ChartRenderer 风格统一）
+  const themeTick = useThemeTick()
+  const option = useMemo(() => {
+    const c = themeColors()
+    return {
+      color: [CATEGORICAL[0], CATEGORICAL[1]],
+      textStyle: { color: c.dim, fontSize: 12 },
+      tooltip: {
+        trigger: 'axis' as const,
+        backgroundColor: c.elev,
+        borderColor: c.border,
+        textStyle: { color: c.text, fontSize: 12 },
+        axisPointer: { type: 'shadow' as const },
+      },
+      legend: {
+        data: [t('admin.llm.inputTokens'), t('admin.llm.outputTokens')],
+        top: 0, textStyle: { color: c.dim, fontSize: 11 }, itemHeight: 8, itemWidth: 14,
+      },
+      grid: { left: 8, right: 24, top: 34, bottom: 8, containLabel: true },
+      xAxis: {
+        type: 'category' as const, data: rows.map((r) => r.key),
+        axisLine: { lineStyle: { color: c.border } },
+        axisLabel: { color: c.mute, fontSize: 10, hideOverlap: true },
+        axisTick: { show: false },
+      },
+      yAxis: {
+        type: 'value' as const,
+        axisLabel: { color: c.mute, fontSize: 11 },
+        splitLine: { lineStyle: { color: c.border, type: 'dashed' as const } },
+      },
+      series: [
+        {
+          name: t('admin.llm.inputTokens'), type: 'bar' as const, stack: 't',
+          data: rows.map((r) => r.input_tokens), barMaxWidth: 26,
+          itemStyle: { color: CATEGORICAL[0], borderRadius: [4, 4, 0, 0] },
+        },
+        {
+          name: t('admin.llm.outputTokens'), type: 'bar' as const, stack: 't',
+          data: rows.map((r) => r.output_tokens), barMaxWidth: 26,
+          itemStyle: { color: CATEGORICAL[1], borderRadius: [4, 4, 0, 0] },
+        },
+      ],
+    }
+  }, [rows, t, themeTick])
 
   if (loading) return <div className="center" style={{ padding: 40 }}><Spinner text={t('admin.llm.loadingUsage')} /></div>
 
@@ -338,63 +372,18 @@ function UsagePanel() {
 function LogsPanel() {
   const { t, lang } = useI18n()
   const locale = lang === 'zh' ? 'zh-CN' : 'en-US'
-  const scenes = sceneLabels(lang)
-  const [data, setData] = useState<{ total: number; rows: LlmCallLog[] }>({ total: 0, rows: [] })
-  const [page, setPage] = useState(1)
-  const [status, setStatus] = useState('')
-  const [scene, setScene] = useState('')
-  const [loading, setLoading] = useState(true)
   const [detail, setDetail] = useState<LlmCallLog | null>(null)
-  const pageSize = 20
-
-  useEffect(() => {
-    setLoading(true)
-    api.llmCallLogs({ status: status || undefined, scene: scene || undefined, page, page_size: pageSize })
-      .then(setData)
-      .catch((e: ApiError) => toast.error(e.message))
-      .finally(() => setLoading(false))
-  }, [page, status, scene])
 
   return (
-    <div className="card">
-      <div className="card-head">
-        <h2>{t('admin.llm.logsTitle')}</h2>
-        <span className="spacer" />
-        <select className="select" style={{ width: 130 }} value={status}
-          onChange={(e) => { setStatus(e.target.value); setPage(1) }}>
-          <option value="">{t('common.allStatus')}</option>
-          {['ok', 'timeout', 'error', 'degraded'].map((s) => <option key={s} value={s}>{s}</option>)}
-        </select>
-        <select className="select" style={{ width: 150 }} value={scene}
-          onChange={(e) => { setScene(e.target.value); setPage(1) }}>
-          <option value="">{t('admin.llm.allScenes')}</option>
-          {Object.entries(scenes).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-        </select>
-      </div>
-      <div style={{ overflow: 'auto' }}>
-        <table className="table">
-          <thead><tr><th>{t('common.time')}</th><th>{t('admin.llm.colScene')}</th><th>{t('admin.llm.colProtocolModel')}</th>
-            <th>{t('admin.logs.colInput')}</th><th>{t('admin.logs.colOutput')}</th>
-            <th>{t('admin.logs.colDuration')}</th><th>{t('common.status')}</th><th>{t('admin.llm.colError')}</th></tr></thead>
-          <tbody>
-            {data.rows.map((r) => (
-              <tr key={r.id} style={{ cursor: 'pointer' }} onClick={() => setDetail(r)}>
-                <td className="tiny">{new Date(r.created_at).toLocaleString(locale)}</td>
-                <td>{r.scene ? (scenes[r.scene] || r.scene) : '-'}</td>
-                <td className="tiny"><span className="mono">{r.model || '-'}</span></td>
-                <td>{r.input_tokens}</td>
-                <td>{r.output_tokens}</td>
-                <td>{r.latency_ms}ms</td>
-                <td><StatusTag value={r.status} /></td>
-                <td className="tiny danger truncate" style={{ maxWidth: 220 }}>{r.error_brief || '-'}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {loading && <div className="center" style={{ padding: 20 }}><Spinner /></div>}
-        {!loading && !data.rows.length && <Empty text={t('admin.llm.emptyCalls')} icon="📜" />}
-      </div>
-      <Pager page={page} pageSize={pageSize} total={data.total} onChange={setPage} />
+    <>
+      <LlmLogsTable
+        title={t('admin.llm.logsTitle')}
+        allScenesText={t('admin.llm.allScenes')}
+        modelColText={t('admin.llm.colProtocolModel')}
+        errorColText={t('admin.llm.colError')}
+        emptyText={t('admin.llm.emptyCalls')}
+        onRowClick={setDetail}
+      />
 
       {detail && (
         <Modal title={t('admin.llm.detailTitle')} onClose={() => setDetail(null)}
@@ -418,7 +407,7 @@ function LogsPanel() {
           </div>
         </Modal>
       )}
-    </div>
+    </>
   )
 }
 

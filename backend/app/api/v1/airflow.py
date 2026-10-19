@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -98,17 +100,25 @@ async def metadata(db: AsyncSession = Depends(get_db), _=Depends(get_current_use
         dags = await cli.list_dags()
     except af.AirflowError as e:
         return {"configured": True, "error": str(e), "dags": []}
-    out = []
-    for d in dags[:60]:
-        dag_id = d.get("dag_id", "")
-        last = None
+    # 逐 DAG latest_run 的串行 HTTP 改为有界并发（Semaphore(8) 限流），
+    # 单个 DAG 失败仍按原语义降级为 last_run=None。
+    sem = asyncio.Semaphore(8)
+
+    async def _last_run(dag_id: str) -> dict | None:
         try:
-            run = await cli.latest_dag_run(dag_id)
+            async with sem:
+                run = await cli.latest_dag_run(dag_id)
             if run:
-                last = {"state": run.get("state"), "start_date": run.get("start_date")}
+                return {"state": run.get("state"), "start_date": run.get("start_date")}
         except af.AirflowError:
             pass
-        out.append({"dag_id": dag_id, "is_paused": d.get("is_paused"),
+        return None
+
+    sel = dags[:60]
+    lasts = await asyncio.gather(*(_last_run(d.get("dag_id", "")) for d in sel))
+    out = []
+    for d, last in zip(sel, lasts):
+        out.append({"dag_id": d.get("dag_id", ""), "is_paused": d.get("is_paused"),
                     "schedule": (d.get("schedule_interval") or {}).get("value")
                     if isinstance(d.get("schedule_interval"), dict) else d.get("schedule_interval"),
                     "last_run": last})

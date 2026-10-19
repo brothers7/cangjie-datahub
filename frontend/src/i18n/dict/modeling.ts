@@ -42,6 +42,11 @@ export default {
     'modeling.rolledBack': 'Rolled back to v{v}',
     'modeling.confirmDeleteTask': 'Delete task "{name}"?',
 
+    'modeling.confirmTitle': 'Please Confirm',
+    'modeling.discardDraftTitle': 'Discard Unsaved Changes?',
+    'modeling.discardDraftText': 'The current task has unsaved changes. Continuing will discard them.',
+    'modeling.discardDraftOk': 'Discard',
+
     'modeling.newTask': 'New Task',
     'modeling.noTasks': 'No tasks yet',
     'modeling.noTargetTable': '(target table TBD)',
@@ -178,6 +183,9 @@ export default {
     'modeling.switchModelToast': 'Session model switched (takes effect next turn)',
     'modeling.restoreModelToast': 'Restored the scene-bound model',
     'modeling.newSessionPrompt': 'Describe your data requirement, e.g.:\nI need a daily GMV summary table by channel for the daily business report',
+    'modeling.newSessionTitle': 'New Modeling Request',
+    'modeling.newSessionLabel': 'Data Requirement',
+    'modeling.startModelingBtn': 'Start Modeling',
     'modeling.aiBusy': 'The AI modeling engineer is working, please wait',
     'modeling.confirmAcceptProposal': 'Accept this proposal?\nModeling task drafts will be created in bulk (DDL will not be auto-executed; manual push after validation is required).',
     'modeling.confirmGotoTasks': 'Task draft created. Go to "Modeling Tasks" to view it?',
@@ -279,6 +287,11 @@ export default {
     'modeling.confirmRollback': '回滚到 v{v}？当前内容会先留档。',
     'modeling.rolledBack': '已回滚到 v{v}',
     'modeling.confirmDeleteTask': '确认删除任务「{name}」？',
+
+    'modeling.confirmTitle': '请确认',
+    'modeling.discardDraftTitle': '放弃未保存的修改？',
+    'modeling.discardDraftText': '当前任务有未保存的修改，继续操作将丢失这些内容。',
+    'modeling.discardDraftOk': '放弃修改',
 
     'modeling.newTask': '新建任务',
     'modeling.noTasks': '暂无任务',
@@ -416,6 +429,9 @@ export default {
     'modeling.switchModelToast': '已切换本会话模型（下一轮生效）',
     'modeling.restoreModelToast': '已恢复场景绑定模型',
     'modeling.newSessionPrompt': '描述你的数据需求，例如：\n我需要一张按天+渠道的 GMV 汇总表，供经营日报使用',
+    'modeling.newSessionTitle': '新建建模需求',
+    'modeling.newSessionLabel': '数据需求',
+    'modeling.startModelingBtn': '开始建模',
     'modeling.aiBusy': 'AI 建模工程师正在工作，请稍候',
     'modeling.confirmAcceptProposal': '确认接受该方案？\n将按方案批量创建建模任务草稿（DDL 不会自动执行，需校验后人工推送）。',
     'modeling.confirmGotoTasks': '已创建任务草稿，是否前往「建模任务」查看？',

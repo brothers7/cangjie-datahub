@@ -5,8 +5,9 @@
 - python：沙箱子进程执行 main.py 的 run(question, ctx)；ctx 为平台预取的只读快照
   （数据源信息 + 表清单 + 指标清单），沙箱不持有任何数据库凭证，也无法直接查库。
 
-安全：上传时静态黑名单扫描；运行时超时/内存限制/环境变量清空；
-网络访问靠静态扫描拦截（socket/requests/urllib/httpx 命中即拒绝上传）。
+安全：上传时静态黑名单扫描 + zip 炸弹声明大小预检；运行时超时/内存限制/环境变量清空
++ 路径围栏（chroot 优先，降级为 open/os.open/io.open monkeypatch，禁读沙箱外绝对路径）；
+网络访问靠静态扫描拦截（socket/requests/urllib/http/ssl/asyncio 等命中即拒绝上传）。
 """
 from __future__ import annotations
 
@@ -39,8 +40,12 @@ PYTHON_MEM_LIMIT = 256 * 1024 * 1024  # 256MB
 _PY_BLACKLIST: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\bos\.(system|popen|spawn|exec[lv])"), "os.system/popen 等进程调用"),
     (re.compile(r"\bimport\s+subprocess|\bfrom\s+subprocess\b"), "subprocess"),
-    (re.compile(r"\bimport\s+(socket|requests|urllib|urllib3|httpx|aiohttp)\b|"
-                r"\bfrom\s+(socket|requests|urllib|urllib3|httpx|aiohttp)\b"), "网络访问库"),
+    (re.compile(r"\bimport\s+(socket|requests|urllib|urllib3|httpx|aiohttp|http|ftplib|smtplib|ssl)\b|"
+                r"\bfrom\s+(socket|requests|urllib|urllib3|httpx|aiohttp|http|ftplib|smtplib|ssl)\b"),
+     "网络/协议访问库"),
+    (re.compile(r"\bimport\s+asyncio\b|\bfrom\s+asyncio\b"), "asyncio（open_connection 等网络能力）"),
+    (re.compile(r"\bimport\s+pathlib\b|\bfrom\s+pathlib\b"), "pathlib 文件系统访问"),
+    (re.compile(r"\b(os|io)\.open\s*\("), "os.open/io.open 文件句柄"),
     (re.compile(r"\bimport\s+(ctypes|multiprocessing|shutil|pty)\b"), "ctypes/multiprocessing/shutil"),
     (re.compile(r"\b(eval|exec)\s*\("), "eval/exec 动态执行"),
     (re.compile(r"\bopen\s*\([^)]*['\"][wax]\+?['\"]"), "文件写入"),
@@ -84,6 +89,10 @@ def parse_package(zip_bytes: bytes) -> SkillPackage:
 
     files: dict[str, str] = {}
     for n in names:
+        info = zf.getinfo(n)
+        # zip 炸弹防御：先看声明的解压后大小，超限直接拒绝，不读内容
+        if info.file_size > MAX_FILE_BYTES:
+            raise ValidationError(f"文件 {n} 声明大小超过上限（256KB），拒绝解压（防 zip 炸弹）")
         data = zf.read(n)
         if len(data) > MAX_FILE_BYTES:
             raise ValidationError(f"文件 {n} 超过大小上限（256KB）")
@@ -171,6 +180,66 @@ def render_prompt(template: str, *, question: str, datasource: str, kg_context: 
 
 # ---------- Python 型沙箱执行 ----------
 
+# 运行时路径围栏（注入 runner 子进程，在 import main 之前生效）：
+# posix 下优先尝试 chroot 到沙箱临时目录（需要 root，通常不可用），
+# 失败静默降级为 monkeypatch builtins.open / os.open / io.open 的方案，
+# 拒绝访问沙箱目录之外的绝对路径（解释器标准库 / site-packages 前缀只读放行，
+# 保证 skill 正常 import 系统库不受影响）。
+_FENCE = r"""
+import json, sys, os, io, contextlib
+import builtins as _builtins
+
+# 1) 优先 chroot（有权限时是最强隔离）；失败静默降级
+_chrooted = False
+if hasattr(os, "chroot") and hasattr(os, "geteuid"):
+    try:
+        if os.geteuid() == 0:
+            os.chroot(os.getcwd())
+            os.chdir("/")
+            _chrooted = True
+    except OSError:
+        _chrooted = False
+
+if not _chrooted:
+    _sandbox_root = os.path.realpath(os.getcwd())
+    # 解释器目录前缀（标准库/site-packages 只读放行）
+    _allow_prefixes = []
+    for _p in (os.path.dirname(os.__file__), sys.base_prefix, sys.prefix,
+               getattr(sys, "exec_prefix", sys.prefix)):
+        if _p:
+            _rp = os.path.realpath(_p)
+            if _rp not in _allow_prefixes:
+                _allow_prefixes.append(_rp)
+    _allow_prefixes = tuple(_allow_prefixes)
+
+    def _path_allowed(path):
+        try:
+            rp = os.path.realpath(os.path.abspath(os.fsdecode(path)))
+        except Exception:
+            return False
+        if rp == _sandbox_root or rp.startswith(_sandbox_root + os.sep):
+            return True
+        return rp.startswith(_allow_prefixes)
+
+    _orig_open = _builtins.open
+    _orig_os_open = os.open
+    _orig_io_open = io.open
+
+    def _safe_open(file, mode="r", *a, **kw):
+        if isinstance(file, (str, bytes, os.PathLike)) and not _path_allowed(file):
+            raise PermissionError(f"沙箱禁止访问沙箱目录外的路径: {file}")
+        return _orig_open(file, mode, *a, **kw)
+
+    def _safe_os_open(path, flags, mode=0o777, *a, **kw):
+        if not _path_allowed(path):
+            raise PermissionError(f"沙箱禁止访问沙箱目录外的路径: {path}")
+        return _orig_os_open(path, flags, mode, *a, **kw)
+
+    _builtins.open = _safe_open
+    io.open = _safe_open
+    os.open = _safe_os_open
+"""
+
 _RUNNER = r"""
 import json, sys, os, io, contextlib
 
@@ -209,7 +278,7 @@ def _run_python_sync(files: dict, entry: str, question: str, ctx: dict) -> dict:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
         with open(os.path.join(td, "_runner.py"), "w", encoding="utf-8") as f:
-            f.write(_RUNNER)
+            f.write(_FENCE + _RUNNER)   # 路径围栏必须先于 import main 生效
         proc = subprocess.run(
             [sys.executable, "-I", "_runner.py"],   # -I: 隔离模式，忽略用户 site/环境
             input=json.dumps({"question": question, "ctx": ctx}, ensure_ascii=False),
@@ -265,7 +334,7 @@ def _run_scheduler_sync(files: dict, entry: str, task: dict) -> dict:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
         with open(os.path.join(td, "_runner.py"), "w", encoding="utf-8") as f:
-            f.write(_SCHED_RUNNER)
+            f.write(_FENCE + _SCHED_RUNNER)   # 路径围栏必须先于 import main 生效
         proc = subprocess.run(
             [sys.executable, "-I", "_runner.py"],
             input=json.dumps(task, ensure_ascii=False),

@@ -93,12 +93,15 @@ async def list_sessions(db: AsyncSession = Depends(get_db), user=Depends(get_cur
     if user.role != Role.ADMIN:
         q = q.where(ModelingSession.user_id == user.id)
     rows = (await db.execute(q)).scalars().all()
-    out = []
-    for s in rows:
-        n = (await db.execute(select(func.count()).select_from(ModelingMessage)
-                              .where(ModelingMessage.session_id == s.id))).scalar() or 0
-        out.append(_session_row(s, n))
-    return out
+    # 消息数一次 group_by 聚合，替代每会话一次 count 查询
+    counts: dict[str, int] = {}
+    if rows:
+        for sid, n in (await db.execute(
+                select(ModelingMessage.session_id, func.count())
+                .where(ModelingMessage.session_id.in_([s.id for s in rows]))
+                .group_by(ModelingMessage.session_id))).all():
+            counts[str(sid)] = n
+    return [_session_row(s, counts.get(str(s.id), 0)) for s in rows]
 
 
 @router.post("")

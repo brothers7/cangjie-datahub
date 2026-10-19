@@ -116,12 +116,19 @@ export function Drawer({ title, onClose, children, sub }: {
   )
 }
 
-export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+export function Field({ label, hint, error, children }: {
+  label: string
+  hint?: string
+  error?: string
+  children: ReactNode
+}) {
   return (
     <div className="field">
       <label>{label}</label>
       {children}
-      {hint && <span className="hint">{hint}</span>}
+      {error
+        ? <span className="hint" style={{ color: 'var(--danger)' }}>{error}</span>
+        : hint && <span className="hint">{hint}</span>}
     </div>
   )
 }
@@ -175,7 +182,9 @@ export function relTime(iso: string | null | undefined, t?: TFn): string {
 }
 
 export function Toasts() {
-  const { toasts, drop } = useApp()
+  // 选择器收窄：只订阅 toasts/drop，避免全 store 变化都触发重渲染
+  const toasts = useApp((s) => s.toasts)
+  const drop = useApp((s) => s.drop)
   if (!toasts.length) return null
   return (
     <div style={{

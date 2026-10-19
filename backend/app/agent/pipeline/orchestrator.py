@@ -601,7 +601,7 @@ async def _generate_and_query(ctx: PipelineContext) -> None:
     # ---- 11. 执行（含缓存） ----
     from app.services import cache_service
     st_query = ctx.step("query")
-    key = cache_service.cache_key(str(ctx.datasource.id), ctx.guarded_sql)
+    key = _cache_key(ctx)
     async with get_session_factory()() as session:
         cached = await cache_service.get_cache(session, key)
         if cached:
@@ -686,7 +686,8 @@ async def _validate_compute(ctx: PipelineContext) -> None:
         ctx.query.columns, ctx.query.rows, metric_cols=list(metric_cols),
         value_ranges=value_ranges,
         expected_dims=[_dim_column(ctx, c) for c in ctx.linked.dimensions if _dim_column(ctx, c)])
-    ctx.cleaned_rows = _apply_masking(ctx, cleaned)
+    # 缓存命中的行在写入缓存时已脱敏，不再二次脱敏（mask_hash 二次哈希会改变值）
+    ctx.cleaned_rows = cleaned if ctx.cache_hit else _apply_masking(ctx, cleaned)
     ctx.validation = validation.to_dict()
     if validation.empty:
         st_check.finish("结果为空")
@@ -964,6 +965,18 @@ def _plain_summary(ctx: PipelineContext) -> str:
     return f"（LLM 服务暂不可用，原始数据摘要）共 {len(ctx.cleaned_rows)} 行；" + "；".join(stats)
 
 
+def _cache_key(ctx: PipelineContext) -> str:
+    """查询缓存键：数据源 + SQL + 脱敏规则签名。
+
+    缓存里存的是脱敏后的行数据；脱敏规则变更后签名变化，旧缓存自然不再命中，
+    避免按过期口径把旧数据发给用户。
+    """
+    from app.services import cache_service
+    rules = getattr(ctx, "_mask_rules", None) or []
+    sig = ";".join(f"{p}:{s}" for p, s in sorted(rules))
+    return cache_service.cache_key(str(ctx.datasource.id), ctx.guarded_sql + "#mask:" + sig)
+
+
 def _apply_masking(ctx: PipelineContext, rows: list[dict]) -> list[dict]:
     """按脱敏规则（列名模式）处理结果行。"""
     rules = getattr(ctx, "_mask_rules", None)
@@ -998,6 +1011,7 @@ def _apply_masking(ctx: PipelineContext, rows: list[dict]) -> list[dict]:
 # ============================ 收尾 ============================
 
 async def _finalize(ctx: PipelineContext, *, success: bool, pending: bool = False) -> None:
+    from app.services import cache_service
     async with get_session_factory()() as session:
         payload: dict = {
             "steps": [s.to_dict() for s in ctx.steps],
@@ -1060,7 +1074,11 @@ async def _finalize(ctx: PipelineContext, *, success: bool, pending: bool = Fals
                 matched_metric_ids=[c.id for c in ctx.linked.metrics],
                 used_dimensions=[c.name for c in ctx.linked.dimensions],
                 time_range=ctx.time_range.to_dict() if ctx.time_range else {},
-                sql_text=ctx.guarded_sql, status=status,
+                sql_text=ctx.guarded_sql,
+                # sql_hash 供夜间反思按「同类查询」聚合沉淀报表模板
+                sql_hash=(cache_service.cache_key(str(ctx.datasource.id), ctx.guarded_sql)
+                          if ctx.datasource and ctx.guarded_sql else ""),
+                status=status,
                 row_count=len(ctx.cleaned_rows), duration_ms=ctx.duration_ms,
                 cache_hit=ctx.cache_hit, error_brief=ctx.error[:500],
                 chart_type=(ctx.chart_spec or {}).get("type", ""))
@@ -1070,11 +1088,11 @@ async def _finalize(ctx: PipelineContext, *, success: bool, pending: bool = Fals
 
         # 缓存写入 + 记忆回写
         if success and ctx.query is not None and not ctx.cache_hit:
-            from app.services import cache_service
-            key = cache_service.cache_key(str(ctx.datasource.id), ctx.guarded_sql)
+            # 存脱敏后的行数据（cleaned_rows）：命中链路直接复用，不再经过执行器
+            key = _cache_key(ctx)
             await cache_service.set_cache(
                 session, key,
-                {"columns": ctx.query.columns, "rows": ctx.query.rows[:500],
+                {"columns": ctx.query.columns, "rows": ctx.cleaned_rows[:500],
                  "row_count": ctx.query.row_count, "duration_ms": ctx.query.duration_ms},
                 ctx.chart_spec, ctx.answer_text)
         await session.commit()

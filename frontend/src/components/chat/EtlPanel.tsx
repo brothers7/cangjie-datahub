@@ -4,6 +4,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api, ApiError } from '@/api/client'
 import { SqlText } from '@/components/common/SqlText'
+import { Confirm } from '@/components/common/ui'
 import { useI18n } from '@/i18n'
 import { toast } from '@/stores/app'
 import type { EtlDesignResult } from '@/types'
@@ -43,6 +44,7 @@ export function EtlPanel({ design, conversationId, datasourceId }: {
   const nav = useNavigate()
   const [pushing, setPushing] = useState(false)
   const [pushMsg, setPushMsg] = useState('')
+  const [confirmPush, setConfirmPush] = useState(false)
 
   const saveAsTask = async () => {
     try {
@@ -62,9 +64,9 @@ export function EtlPanel({ design, conversationId, datasourceId }: {
     }
   }
 
+  // 人工二次确认（PRD 安全边界）：确认弹窗点确定后执行
   const push = async () => {
-    // 人工二次确认（PRD 安全边界）
-    if (!window.confirm(t('chat.confirmPush', { name: design.target_table || t('chat.thisEtlPlan') }))) return
+    setConfirmPush(false)
     setPushing(true)
     setPushMsg('')
     try {
@@ -94,7 +96,7 @@ export function EtlPanel({ design, conversationId, datasourceId }: {
               <button className="btn sm primary" onClick={() => void saveAsTask()}>
                 {t('chat.toModelingTask')}
               </button>
-              <button className="btn sm" disabled={pushing} onClick={() => void push()}>
+              <button className="btn sm" disabled={pushing} onClick={() => setConfirmPush(true)}>
                 {pushing ? t('chat.pushing') : t('chat.pushToAzkaban')}
               </button>
               <button className="btn ghost sm" disabled={pushing}
@@ -107,6 +109,14 @@ export function EtlPanel({ design, conversationId, datasourceId }: {
         </div>
         {design.schedule && <div className="tiny muted mt8">{t('chat.scheduleAdvice')}{design.schedule}</div>}
         {pushMsg && <div className="tiny muted mt8">{pushMsg}</div>}
+        {confirmPush && (
+          <Confirm
+            title={t('chat.pushToAzkaban')}
+            text={t('chat.confirmPush', { name: design.target_table || t('chat.thisEtlPlan') })}
+            onCancel={() => setConfirmPush(false)}
+            onOk={() => void push()}
+          />
+        )}
 
         {design.source_tables.length > 0 && (
           <div className="mt12">

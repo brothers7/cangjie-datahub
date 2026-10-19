@@ -3,7 +3,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api, ApiError } from '@/api/client'
 import { Markdown } from '@/components/common/Markdown'
-import { Empty, relTime, Spinner } from '@/components/common/ui'
+import { Confirm, Empty, relTime, Spinner } from '@/components/common/ui'
 import { useI18n } from '@/i18n'
 import { useApp, toast } from '@/stores/app'
 import type { GovernanceFinding, GovernanceRunRow } from '@/types'
@@ -28,6 +28,7 @@ export default function GovernancePage() {
     findings: { level: string; column: string; issue: string; suggestion: string }[]
   } | null>(null)
   const [probing, setProbing] = useState(false)
+  const [gotoTask, setGotoTask] = useState<string | null>(null)
 
   const domainLabel = (d: string) => (DOMAIN_KEYS.has(d) ? t(`gov.domain.${d}`) : d)
   const domainShort = (d: string) => (DOMAIN_KEYS.has(d) ? t(`gov.domainShort.${d}`) : d.slice(0, 2))
@@ -62,9 +63,7 @@ export default function GovernancePage() {
         title: f.title, object: f.object, suggestion: f.suggestion,
       })
       toast.ok(t('gov.taskDraftCreated'))
-      if (window.confirm(t('gov.gotoModeling'))) {
-        nav(`/modeling?task=${r.task_id}`)
-      }
+      setGotoTask(r.task_id)
     } catch (e) { toast.error((e as ApiError).message) }
   }
 
@@ -212,6 +211,12 @@ export default function GovernancePage() {
           </div>
         </div>
       </div>
+      {gotoTask && (
+        <Confirm title={t('gov.taskDraftCreated')}
+          text={t('gov.gotoModeling')}
+          onCancel={() => setGotoTask(null)}
+          onOk={() => { const id = gotoTask; setGotoTask(null); nav(`/modeling?task=${id}`) }} />
+      )}
     </div>
   )
 }

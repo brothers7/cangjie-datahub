@@ -1,17 +1,26 @@
 /** AI 建模建议会话（PRD 3.3D-1）：需求 → 方案 → 对话修订 → 接受一键落地。 */
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api, ApiError } from '@/api/client'
 import { streamSse } from '@/api/sse'
 import { StepTimeline, type StepState } from '@/components/chat/StepTimeline'
 import { SqlText } from '@/components/common/SqlText'
 import { Markdown } from '@/components/common/Markdown'
-import { Empty, relTime, Spinner } from '@/components/common/ui'
+import { Confirm, Empty, Field, Modal, relTime, Spinner } from '@/components/common/ui'
 import { toast } from '@/stores/app'
 import { useI18n } from '@/i18n'
 import type { AcceptResult, EtlDesignResult, ModelingMessageRow, ModelingProposal, ModelingSessionRow, ProposalTable , LlmChatOption } from '@/types'
 
 interface EngineInfo { engine: string; engine_name: string; scene: string; model: string; available: boolean }
+
+/** 待确认动作（自研 Confirm 替换 window.confirm）：确认后执行 action */
+interface ConfirmReq {
+  title: string
+  text: ReactNode
+  danger?: boolean
+  okText?: string
+  action: () => void
+}
 
 /** 方案表 → EtlDesignResult（与对话 ETL 面板同款动作的入参，PRD 3.3D-1） */
 function toDesign(t: ProposalTable, proposal: ModelingProposal): EtlDesignResult {
@@ -37,6 +46,14 @@ export function AiModelingPanel({ onAccepted }: { onAccepted: () => void }) {
   const [accepting, setAccepting] = useState('')
   const abortRef = useRef<(() => void) | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  // 自研确认弹窗（替换 window.confirm）
+  const [confirm, setConfirm] = useState<ConfirmReq | null>(null)
+  // 新建建模需求（替换 window.prompt 的 Modal 表单）
+  const [newOpen, setNewOpen] = useState(false)
+  const [newReq, setNewReq] = useState('')
+  // 当前会话 id 的 ref：SSE 回调等闭包内判断会话是否已切换
+  const activeIdRef = useRef(activeId)
+  useEffect(() => { activeIdRef.current = activeId }, [activeId])
 
   const loadSessions = useCallback(async (keep?: string) => {
     try {
@@ -65,23 +82,30 @@ export function AiModelingPanel({ onAccepted }: { onAccepted: () => void }) {
     setRunning(false)
     setLiveSteps([])
     if (!activeId) { setMessages([]); return }
-    api.getModelingSession(activeId).then((d) => setMessages(d.messages))
-      .catch((e) => toast.error((e as ApiError).message))
+    // 快速切换会话的顺序守卫：过期响应直接丢弃，避免旧会话数据覆盖新会话
+    let cancelled = false
+    api.getModelingSession(activeId)
+      .then((d) => { if (!cancelled) setMessages(d.messages) })
+      .catch((e) => { if (!cancelled) toast.error((e as ApiError).message) })
+    return () => { cancelled = true }
   }, [activeId])
   useEffect(() => {
     const el = scrollRef.current
     if (el) el.scrollTop = el.scrollHeight
   }, [messages, liveSteps.length])
 
-  const newSession = async () => {
-    const requirement = window.prompt(t('modeling.newSessionPrompt'))
-    if (!requirement?.trim()) return
+  /** 创建会话并直接发起首轮建模（Modal 表单提交） */
+  const createSession = async () => {
+    const requirement = newReq.trim()
+    if (!requirement) return
     try {
-      const s = await api.createModelingSession({ requirement: requirement.trim() })
+      const s = await api.createModelingSession({ requirement })
+      setNewOpen(false)
+      setNewReq('')
       await loadSessions(s.id)
       setActiveId(s.id)
       // 首条需求直接发起建模
-      setTimeout(() => void send(s.id, requirement.trim()), 50)
+      setTimeout(() => void send(s.id, requirement), 50)
     } catch (e) { toast.error((e as ApiError).message) }
   }
 
@@ -107,32 +131,57 @@ export function AiModelingPanel({ onAccepted }: { onAccepted: () => void }) {
       onError: (d) => toast.error(d.message),
       onDone: async () => {
         setRunning(false)
-        try {
-          const d = await api.getModelingSession(sid)
-          setMessages(d.messages)
-        } catch { /* ignore */ }
+        // 流结束时若已切换到其他会话，不再回写消息列表（避免竞态覆盖）
+        if (activeIdRef.current === sid) {
+          try {
+            const d = await api.getModelingSession(sid)
+            if (activeIdRef.current === sid) setMessages(d.messages)
+          } catch { /* ignore */ }
+        }
         void loadSessions(sid)
       },
     })
   }
 
-  const accept = async (messageId: string) => {
-    if (!activeId || !window.confirm(t('modeling.confirmAcceptProposal'))) return
+  const accept = (messageId: string) => {
+    if (!activeId) return
+    setConfirm({
+      title: t('modeling.confirmTitle'),
+      text: <span style={{ whiteSpace: 'pre-line' }}>{t('modeling.confirmAcceptProposal')}</span>,
+      action: () => void doAccept(messageId),
+    })
+  }
+
+  const doAccept = async (messageId: string) => {
+    if (!activeId) return
     setAccepting(messageId)
     try {
       const r: AcceptResult = await api.acceptModelingProposal(activeId, messageId)
       toast.ok(r.message)
       const failed = r.results.filter((x) => !x.ok)
       if (failed.length) toast.warn(failed.map((f) => `${f.table}: ${f.error}`).join('；'))
-      if (r.created > 0 && window.confirm(t('modeling.confirmGotoTasks'))) {
-        onAccepted()
+      if (r.created > 0) {
+        setConfirm({
+          title: t('modeling.confirmTitle'),
+          text: t('modeling.confirmGotoTasks'),
+          action: () => onAccepted(),
+        })
       }
       void loadSessions(activeId)
     } catch (e) { toast.error((e as ApiError).message) } finally { setAccepting('') }
   }
 
-  const remove = async (id: string) => {
-    if (!window.confirm(t('modeling.confirmDeleteSession'))) return
+  const remove = (id: string) => {
+    setConfirm({
+      title: t('modeling.confirmTitle'),
+      text: t('modeling.confirmDeleteSession'),
+      danger: true,
+      okText: t('common.delete'),
+      action: () => void doRemove(id),
+    })
+  }
+
+  const doRemove = async (id: string) => {
     try {
       await api.deleteModelingSession(id)
       if (id === activeId) setActiveId('')
@@ -148,7 +197,7 @@ export function AiModelingPanel({ onAccepted }: { onAccepted: () => void }) {
       <div className="card" style={{ width: 260, flexShrink: 0 }}>
         <div className="card-body" style={{ padding: 8 }}>
           <button className="btn primary" style={{ width: '100%', marginBottom: 8 }}
-            onClick={() => void newSession()}>＋ {t('modeling.newSessionBtn')}</button>
+            onClick={() => { setNewReq(''); setNewOpen(true) }}>＋ {t('modeling.newSessionBtn')}</button>
           {sessions.length === 0 && <div className="empty tiny" style={{ padding: 16 }}>{t('modeling.noSessions')}</div>}
           {sessions.map((s) => (
             <div key={s.id} className={`conv ${s.id === activeId ? 'active' : ''}`}
@@ -212,7 +261,7 @@ export function AiModelingPanel({ onAccepted }: { onAccepted: () => void }) {
                 placeholder={t('modeling.chatPlaceholder')}
                 value={input} onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (input.trim()) send(active.id, input.trim()) }
+                  if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); if (input.trim()) send(active.id, input.trim()) }
                 }} />
               <button className="btn primary" disabled={running || !input.trim()}
                 onClick={() => send(active.id, input.trim())}>{t('modeling.sendBtn')}</button>
@@ -220,6 +269,35 @@ export function AiModelingPanel({ onAccepted }: { onAccepted: () => void }) {
           </div>
         )}
       </div>
+
+      {/* 新建建模需求（替换 window.prompt 的 Modal 表单） */}
+      {newOpen && (
+        <Modal title={t('modeling.newSessionTitle')} onClose={() => setNewOpen(false)} width={560}
+          footer={<>
+            <button className="btn" onClick={() => setNewOpen(false)}>{t('common.cancel')}</button>
+            <button className="btn primary" disabled={!newReq.trim()}
+              onClick={() => void createSession()}>{t('modeling.startModelingBtn')}</button>
+          </>}>
+          <Field label={t('modeling.newSessionLabel')}>
+            <textarea className="input" rows={4} autoFocus
+              placeholder={t('modeling.newSessionPrompt')}
+              value={newReq} onChange={(e) => setNewReq(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                  e.preventDefault()
+                  if (newReq.trim()) void createSession()
+                }
+              }} />
+          </Field>
+        </Modal>
+      )}
+
+      {/* 自研确认弹窗（替换 window.confirm） */}
+      {confirm && (
+        <Confirm title={confirm.title} text={confirm.text} danger={confirm.danger} okText={confirm.okText}
+          onCancel={() => setConfirm(null)}
+          onOk={() => { const a = confirm.action; setConfirm(null); a() }} />
+      )}
     </div>
   )
 }
@@ -264,6 +342,8 @@ function ProposalCard({ proposal, sessionId, locked }: { proposal: ModelingPropo
   const [open, setOpen] = useState<string>('')
   const [busy, setBusy] = useState('')
   const nav = useNavigate()
+  // 自研确认弹窗（替换 window.confirm）
+  const [confirm, setConfirm] = useState<ConfirmReq | null>(null)
 
   // 与对话 ETL 面板（§3.3B）一致的三个动作：转任务 / 推送 Azkaban / 下载 zip
   const saveAsTask = async (t: ProposalTable) => {
@@ -278,12 +358,23 @@ function ProposalCard({ proposal, sessionId, locked }: { proposal: ModelingPropo
         modeling_session_id: sessionId || null, datasource_id: null,
       })
       toast.ok(tr('modeling.taskCreatedToast', { name: task.name }))
-      if (window.confirm(tr('modeling.confirmGotoTasks'))) nav(`/modeling?task=${task.id}`)
+      setConfirm({
+        title: tr('modeling.confirmTitle'),
+        text: tr('modeling.confirmGotoTasks'),
+        action: () => nav(`/modeling?task=${task.id}`),
+      })
     } catch (e) { toast.error((e as ApiError).message) } finally { setBusy('') }
   }
 
-  const push = async (t: ProposalTable) => {
-    if (!window.confirm(tr('modeling.confirmPushProposal', { name: t.name }))) return
+  const push = (t: ProposalTable) => {
+    setConfirm({
+      title: tr('modeling.confirmTitle'),
+      text: <span style={{ whiteSpace: 'pre-line' }}>{tr('modeling.confirmPushProposal', { name: t.name })}</span>,
+      action: () => void doPush(t),
+    })
+  }
+
+  const doPush = async (t: ProposalTable) => {
     setBusy(t.name)
     try {
       const r = await api.pushEtlToAzkaban(toDesign(t, proposal), t.cron || '')
@@ -342,6 +433,13 @@ function ProposalCard({ proposal, sessionId, locked }: { proposal: ModelingPropo
           </div>
         </div>
       ))}
+
+      {/* 自研确认弹窗（替换 window.confirm） */}
+      {confirm && (
+        <Confirm title={confirm.title} text={confirm.text} danger={confirm.danger} okText={confirm.okText}
+          onCancel={() => setConfirm(null)}
+          onOk={() => { const a = confirm.action; setConfirm(null); a() }} />
+      )}
     </div>
   )
 }

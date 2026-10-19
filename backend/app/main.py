@@ -27,10 +27,23 @@ async def lifespan(app: FastAPI):
             await conn.run_sync(Base.metadata.create_all)
         from app.bootstrap import bootstrap
         await bootstrap()
+    # 回收上次进程遗留的悬挂扫描任务（RUNNING 超时 → FAILED）。
+    # Docker 部署下 bootstrap 在 entrypoint 进程执行，这里需独立兜底。
+    try:
+        from app.bootstrap import reap_stale_scan_jobs
+        from app.db.session import get_session_factory
+        async with get_session_factory()() as s:
+            await reap_stale_scan_jobs(s)
+            await s.commit()
+    except Exception:
+        logger.exception("reap stale scan jobs failed")
     from app.jobs.scheduler import start_scheduler, stop_scheduler
     start_scheduler()
     yield
     stop_scheduler()
+    # 关闭应用库引擎连接池（await dispose，不残留）
+    from app.bootstrap import dispose_app_engine
+    await dispose_app_engine()
 
 
 def create_app() -> FastAPI:

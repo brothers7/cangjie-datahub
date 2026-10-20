@@ -121,7 +121,8 @@ export default function DataSourcesPage() {
     setTesting(ds.id)
     try {
       const r = await api.testDatasource(ds.id)
-      r.ok ? toast.ok(t('ds.testOk', { msg: r.message })) : toast.error(t('ds.testFail', { msg: r.message }))
+      if (r.ok) toast.ok(t('ds.testOk', { msg: r.message }))
+      else toast.error(t('ds.testFail', { msg: r.message }))
       await refresh()
     } catch (e) {
       toast.error((e as ApiError).message)

@@ -46,6 +46,9 @@ export function TasksPanel() {
   const [execs, setExecs] = useState<{ exec_id: number; status: string; end_time: number }[] | null>(null)
   const isAdmin = useAuth((st) => st.user?.role === 'admin')
   const [localRuns, setLocalRuns] = useState<SchedulerRunRow[] | null>(null)
+  // 级联触发（内置调度）：勾选后触发本任务会级联带动下游任务
+  const [cascade, setCascade] = useState(false)
+  const [cascadeRuns, setCascadeRuns] = useState<SchedulerRunRow[] | null>(null)
   // 自研确认弹窗（替换 window.confirm）
   const [confirm, setConfirm] = useState<ConfirmReq | null>(null)
   // AI 对话式修订（PRD 3.3D-3）
@@ -109,6 +112,7 @@ export function TasksPanel() {
     setVersions(null)
     setExecs(null)
     setLocalRuns(null)
+    setCascadeRuns(null)
     reviseAbortRef.current?.()
     setRevising(false)
     setReviseHistory([])
@@ -284,12 +288,20 @@ export function TasksPanel() {
   const triggerNow = async () => {
     if (!draft) return
     try {
-      const r = await api.triggerTask(draft.id)
-      const st = r.run.status
-      if (st === 'success') toast.ok(t('modeling.runSuccess', { ds: r.run.ds }))
-      else if (st === 'blocked') toast.warn(t('modeling.runBlocked', { msg: r.run.message }))
-      else if (st === 'waiting') toast.warn(t('modeling.runWaiting', { msg: r.run.message }))
-      else toast.error(t('modeling.runFailed', { msg: r.run.message }))
+      const r = await api.triggerTask(draft.id, '', cascade)
+      const runs = r.runs || r.cascaded || []
+      if (runs.length > 1) {
+        // 级联触发返回多任务清单：结果区逐任务展示状态
+        setCascadeRuns(runs)
+        toast.ok(t('modeling.cascadeToast', { n: runs.length }))
+      } else {
+        setCascadeRuns(null)
+        const st = r.run.status
+        if (st === 'success') toast.ok(t('modeling.runSuccess', { ds: r.run.ds }))
+        else if (st === 'blocked') toast.warn(t('modeling.runBlocked', { msg: r.run.message }))
+        else if (st === 'waiting') toast.warn(t('modeling.runWaiting', { msg: r.run.message }))
+        else toast.error(t('modeling.runFailed', { msg: r.run.message }))
+      }
       await loadLocalRuns()
     } catch (e) { toast.error((e as ApiError).message) }
   }
@@ -550,9 +562,29 @@ export function TasksPanel() {
                   )}
                   <button className="btn ghost sm" disabled={!draft.sched_enabled}
                     onClick={() => void triggerNow()}>▶ {t('modeling.triggerNow')}</button>
+                  <label className="tiny row" style={{ gap: 6, cursor: 'pointer' }} title={t('modeling.cascadeHint')}>
+                    <input type="checkbox" checked={cascade}
+                      onChange={(e) => setCascade(e.target.checked)} />
+                    {t('modeling.cascadeDownstream')}
+                  </label>
                   <button className="btn ghost sm" onClick={() => void loadLocalRuns()}>{t('modeling.runHistory')}</button>
                 </div>
               </div>
+              {cascadeRuns && (
+                <div className="mt8">
+                  <div className="tiny dim" style={{ marginBottom: 4 }}>{t('modeling.cascadeResultTitle')}</div>
+                  {cascadeRuns.map((r) => (
+                    <div key={r.id} className="tiny row" style={{ gap: 6, padding: '2px 0' }}>
+                      <StatusTag
+                        value={r.status === 'success' ? 'success' : r.status === 'failed' ? 'failed' : 'running'}
+                        label={runStatusLabel(t)[r.status] || r.status} />
+                      <span className="truncate">{r.task_name}</span>
+                      <code className="tiny muted">{r.ds}</code>
+                      {r.message && <span className="tiny muted truncate">{r.message}</span>}
+                    </div>
+                  ))}
+                </div>
+              )}
               {localRuns && (
                 <div className="mt8">
                   {localRuns.length === 0 && <span className="tiny muted">{t('modeling.noRuns')}</span>}

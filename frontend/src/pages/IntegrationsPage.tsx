@@ -32,6 +32,7 @@ function SkillsPanel() {
   const [rows, setRows] = useState<CustomSkillRow[]>([])
   const [busy, setBusy] = useState(false)
   const [confirmDel, setConfirmDel] = useState<CustomSkillRow | null>(null)
+  const [confirmRb, setConfirmRb] = useState<CustomSkillRow | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
   const load = useCallback(async () => {
@@ -73,6 +74,18 @@ function SkillsPanel() {
       await api.deleteSkill(s.id)
       toast.ok(t('common.deleted'))
       setConfirmDel(null)
+      await load()
+    } catch (e) {
+      toast.error((e as ApiError).message)
+    }
+  }
+
+  // 版本回滚：把历史版本置为启用（当前启用版本由后端停用）
+  const rollback = async (s: CustomSkillRow) => {
+    try {
+      await api.rollbackSkill(s.id, s.version)
+      toast.ok(t('admin.integ.rolledBackSkill', { name: s.name, version: s.version }))
+      setConfirmRb(null)
       await load()
     } catch (e) {
       toast.error((e as ApiError).message)
@@ -134,6 +147,11 @@ function SkillsPanel() {
                       <td className="muted">{relTime(s.created_at, t)}</td>
                       <td>
                         <div className="row" style={{ gap: 6, justifyContent: 'flex-end' }}>
+                          {s.status !== 'enabled' && (
+                            <button className="btn ghost sm" onClick={() => setConfirmRb(s)}>
+                              {t('admin.integ.rollbackBtn')}
+                            </button>
+                          )}
                           {s.status === 'enabled'
                             ? <button className="btn sm" onClick={() => void setStatus(s, 'disabled')}>{t('common.disable')}</button>
                             : <button className="btn sm primary" onClick={() => void setStatus(s, 'enabled')}>{t('common.enable')}</button>}
@@ -157,6 +175,11 @@ function SkillsPanel() {
           <Confirm title={t('admin.integ.deleteSkillTitle')} danger okText={t('common.delete')}
             text={t('admin.integ.confirmDeleteSkill', { name: confirmDel.name, version: confirmDel.version })}
             onCancel={() => setConfirmDel(null)} onOk={() => void remove(confirmDel)} />
+        )}
+        {confirmRb && (
+          <Confirm title={t('admin.integ.rollbackSkillTitle')} danger okText={t('admin.integ.rollbackBtn')}
+            text={t('admin.integ.confirmRollbackSkill', { name: confirmRb.name, version: confirmRb.version })}
+            onCancel={() => setConfirmRb(null)} onOk={() => void rollback(confirmRb)} />
         )}
       </div>
     </div>

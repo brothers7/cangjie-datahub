@@ -134,7 +134,6 @@ export function streamAsk(
         if (name === 'done') gotDone = true
         try {
           const d = JSON.parse(raw)
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           ;(handlers[key] as ((x: any) => void) | undefined)?.(d)
         } catch { /* 忽略无法解析的事件 */ }
       })

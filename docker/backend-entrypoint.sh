@@ -30,5 +30,5 @@ echo "[entrypoint] bootstrap (create tables / admin / demo db / first scan)..."
 # --reseed-demo 可选；正常首启幂等
 python -m app.bootstrap "$@"
 
-echo "[entrypoint] starting uvicorn..."
-exec uvicorn app.main:app --host 0.0.0.0 --port 9000 --workers 1
+echo "[entrypoint] starting uvicorn (workers=${UVICORN_WORKERS:-1})..."
+exec uvicorn app.main:app --host 0.0.0.0 --port 9000 --workers "${UVICORN_WORKERS:-1}"

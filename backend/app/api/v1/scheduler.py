@@ -67,6 +67,7 @@ async def list_runs(task_id: str = "", limit: int = 50,
 
 class TriggerIn(BaseModel):
     ds: str = ""
+    cascade: bool = False  # 级联触发全部下游（拓扑序，仍受依赖与双重闸门约束）
 
 
 @router.post("/tasks/{task_id}/trigger")
@@ -83,9 +84,12 @@ async def trigger_task(task_id: str, body: TriggerIn, db: AsyncSession = Depends
             _dt.strptime(body.ds, "%Y-%m-%d")
         except ValueError:
             raise ValidationError("业务日期不是有效日期")
-    run = await engine.trigger(db, t, user, body.ds)
+    result = await engine.trigger(db, t, user, body.ds, cascade=body.cascade)
     await db.commit()
-    return {"run": _run_row(run, t)}
+    if body.cascade:
+        # 级联返回逐任务结果清单（首元素为本任务）
+        return {"runs": result}
+    return {"run": _run_row(result, t)}
 
 
 @router.post("/runs/{run_id}/retry")

@@ -157,6 +157,9 @@ class LlmConfigOut(BaseModel):
     status: str
     status_message: str
     health_latency_ms: int | None
+    # 近 15 分钟调用失败率（列表端点聚合附加；无调用为 None/0）
+    failure_rate_15m: float | None = None
+    calls_15m: int | None = None
     last_health_at: datetime | None
 
 

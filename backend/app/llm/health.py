@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import time
 
-from sqlalchemy import select, update
 
 from app.core.crypto import decrypt
 from app.db.models.llm import LlmConfig, LlmHealthStatus, ModelKind

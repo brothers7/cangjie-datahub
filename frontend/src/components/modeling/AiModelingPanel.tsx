@@ -34,7 +34,6 @@ function toDesign(t: ProposalTable, proposal: ModelingProposal): EtlDesignResult
 
 export function AiModelingPanel({ onAccepted }: { onAccepted: () => void }) {
   const { t } = useI18n()
-  const nav = useNavigate()
   const [sessions, setSessions] = useState<ModelingSessionRow[]>([])
   const [activeId, setActiveId] = useState('')
   const [messages, setMessages] = useState<ModelingMessageRow[]>([])
@@ -338,10 +337,10 @@ function MessageBubble({ msg, sessionId, sessionStatus, accepting, onAccept }: {
 }
 
 function ProposalCard({ proposal, sessionId, locked }: { proposal: ModelingProposal; sessionId: string; locked?: boolean }) {
+  const nav = useNavigate()
   const { t: tr } = useI18n()
   const [open, setOpen] = useState<string>('')
   const [busy, setBusy] = useState('')
-  const nav = useNavigate()
   // 自研确认弹窗（替换 window.confirm）
   const [confirm, setConfirm] = useState<ConfirmReq | null>(null)
 

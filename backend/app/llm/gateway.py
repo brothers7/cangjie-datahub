@@ -10,10 +10,12 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 
 import httpx
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.core.crypto import decrypt
 from app.core.errors import LLMError
 from app.db.models.llm import CallStatus, LlmCallLog, LlmConfig, LlmScene, LlmSceneBinding, ModelKind, Protocol
@@ -59,6 +61,10 @@ class _TTLCache:
 
 cache = _TTLCache()
 
+# 失败告警节流：同一配置 5 分钟内最多发 1 次 webhook（进程内记录）
+ALERT_THROTTLE_SEC = 300.0
+_ALERT_LAST_SENT: dict[str, float] = {}
+
 
 def invalidate_config_cache() -> None:
     """配置变更后由 API 层调用，立即生效。"""
@@ -90,12 +96,15 @@ class LLMGateway:
         )
 
     async def resolve_scene(self, scene: LlmScene | str, *, kind: ModelKind = ModelKind.CHAT,
-                            override_config_id: str | None = None) -> ResolvedConfig:
+                            override_config_id: str | None = None,
+                            conversation_id: str | None = None) -> ResolvedConfig:
         """解析某场景应使用的模型配置。
         override_config_id：会话级覆盖（用户在对话里手动选了大模型），优先于场景绑定与全局默认。
+        conversation_id：new_session 切换策略接线——会话已锁定快照且快照配置仍为
+        new_session 时沿用快照；否则按当前默认/绑定解析，命中 new_session 配置则落快照。
         """
         scene_key = scene.value if isinstance(scene, LlmScene) else str(scene)
-        cache_key = f"scene:{kind.value}:{scene_key}:{override_config_id or ''}"
+        cache_key = f"scene:{kind.value}:{scene_key}:{override_config_id or ''}:{conversation_id or ''}"
         cached = cache.get(cache_key)
         if cached:
             return cached  # type: ignore[return-value]
@@ -124,6 +133,10 @@ class LLMGateway:
                     .order_by(LlmConfig.created_at)
                     .limit(1)
                 )).scalar_one_or_none()
+            if (conversation_id and kind == ModelKind.CHAT and not override_config_id
+                    and config_row is not None):
+                config_row = await self._apply_session_snapshot(
+                    session, conversation_id, config_row)
         if config_row is None:
             raise LLMError(
                 "尚未配置 LLM 模型，请管理员在「LLM 配置」页添加"
@@ -132,6 +145,39 @@ class LLMGateway:
         resolved = self._to_resolved(config_row)
         cache.set(cache_key, resolved)
         return resolved
+
+    async def _apply_session_snapshot(self, session, conversation_id: str,
+                                      config_row: LlmConfig) -> LlmConfig:
+        """new_session 切换策略：进行中的旧会话继续走旧配置，新会话用新配置。
+
+        - 会话已有快照且快照配置仍为 new_session → 返回快照配置（默认/绑定变更不影响）；
+        - 快照配置被删或策略改回 immediate → 清快照，按当前解析结果走；
+        - 无快照且当前解析命中 new_session 配置 → 落快照（首次解析即锁定）。
+        """
+        from app.db.models.chat import Conversation  # 延迟导入避免循环依赖
+        try:
+            conv = await session.get(Conversation, uuid.UUID(str(conversation_id)))
+        except (ValueError, AttributeError):
+            return config_row
+        if conv is None:
+            return config_row
+        dirty = False
+        snap_id = getattr(conv, "llm_snapshot_config_id", None)
+        if snap_id:
+            snap = await session.get(LlmConfig, snap_id)
+            if snap is not None and snap.switch_policy == "new_session":
+                return snap  # 旧会话沿用快照配置
+            conv.llm_snapshot_config_id = None  # 快照失效：配置删除或策略已改回即时生效
+            dirty = True
+        if config_row.switch_policy == "new_session":
+            conv.llm_snapshot_config_id = config_row.id
+            dirty = True
+        if dirty:
+            try:
+                await session.commit()  # 快照持久化失败不阻断解析
+            except Exception:
+                logger.warning("会话 LLM 快照写入失败（不影响本次解析）", exc_info=True)
+        return config_row
 
     # ---------- 调用（含重试与降级） ----------
     async def _call_with_retry(self, cfg: ResolvedConfig, adapter, messages, **kw) -> LLMResponse:
@@ -173,7 +219,8 @@ class LLMGateway:
                    override_config_id: str | None = None,
                    temperature: float | None = None, max_tokens: int | None = None,
                    top_p: float | None = None) -> LLMResponse:
-        cfg = await self.resolve_scene(scene, override_config_id=override_config_id)
+        cfg = await self.resolve_scene(scene, override_config_id=override_config_id,
+                                       conversation_id=conversation_id)
         chain = await self._resolve_chain(cfg)
         primary_err: Exception | None = None
         for idx, c in enumerate(chain):
@@ -194,6 +241,7 @@ class LLMGateway:
                 await self._log(c, scene, LLMUsage(), time.monotonic() - t0,
                                 CallStatus.ERROR, str(e)[:500], conversation_id, None)
                 if idx == len(chain) - 1:
+                    await self._maybe_alert(c, scene, e)  # 重试+降级后仍失败：主动告警
                     raise LLMError(f"LLM 调用失败（{c.name}）: {e}") from e
         raise LLMError("LLM 调用失败")
 
@@ -203,7 +251,8 @@ class LLMGateway:
                           temperature: float | None = None, max_tokens: int | None = None,
                           top_p: float | None = None) -> AsyncIterator[StreamChunk]:
         """流式调用。降级仅在「首个增量产出前失败」时启用，避免重复输出。"""
-        cfg = await self.resolve_scene(scene, override_config_id=override_config_id)
+        cfg = await self.resolve_scene(scene, override_config_id=override_config_id,
+                                       conversation_id=conversation_id)
         chain = await self._resolve_chain(cfg)
         primary_err: Exception | None = None
 
@@ -229,6 +278,7 @@ class LLMGateway:
                 await self._log(c, scene, usage, time.monotonic() - t0,
                                 CallStatus.ERROR, str(e)[:500], conversation_id, None)
                 if produced or idx == len(chain) - 1:
+                    await self._maybe_alert(c, scene, e)  # 彻底失败：主动告警
                     raise LLMError(f"LLM 流式调用失败（{c.name}）: {e}") from e
                 primary_err = primary_err or e
         raise LLMError("LLM 流式调用失败")
@@ -247,6 +297,7 @@ class LLMGateway:
         except Exception as e:
             await self._log(cfg, scene, LLMUsage(), time.monotonic() - t0,
                             CallStatus.ERROR, str(e)[:500], None, None)
+            await self._maybe_alert(cfg, scene, e)  # 彻底失败：主动告警
             raise LLMError(f"embedding 调用失败: {e}") from e
 
     async def embedding_available(self) -> bool:
@@ -255,6 +306,35 @@ class LLMGateway:
             return True
         except LLMError:
             return False
+
+    # ---------- 失败告警 ----------
+    async def _maybe_alert(self, cfg: ResolvedConfig, scene: LlmScene | str, error: Exception) -> None:
+        """LLM 彻底失败（重试 + 降级链后仍失败）时向 webhook 主动告警。
+
+        未配置 settings.alert_webhook_url 时直接跳过；同一配置 5 分钟内最多 1 次；
+        webhook 发送失败只记日志，绝不影响主调用链。
+        """
+        try:
+            url = getattr(settings, "alert_webhook_url", "") or ""
+            if not url:
+                return
+            now = time.monotonic()
+            if now - _ALERT_LAST_SENT.get(cfg.config_id, -1e12) < ALERT_THROTTLE_SEC:
+                return  # 节流：同配置 5 分钟内不重复告警
+            _ALERT_LAST_SENT[cfg.config_id] = now
+            payload = {
+                "type": "llm_failure",
+                "config_name": cfg.name,
+                "config_id": cfg.config_id,
+                "scene": scene.value if isinstance(scene, LlmScene) else str(scene),
+                "model": cfg.model,
+                "error": str(error)[:500],
+                "time": datetime.now(UTC).isoformat(),
+            }
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(url, json=payload)
+        except Exception:
+            logger.warning("LLM 失败告警 webhook 发送失败（不影响主链路）", exc_info=True)
 
     # ---------- 日志 ----------
     async def _log(self, cfg: ResolvedConfig, scene: LlmScene | str, usage: LLMUsage,

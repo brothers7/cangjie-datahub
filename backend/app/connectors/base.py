@@ -6,7 +6,7 @@ import decimal
 import datetime as dt
 import logging
 import time
-from abc import ABC, abstractmethod
+from abc import ABC
 from dataclasses import dataclass, field
 from urllib.parse import quote_plus
 
@@ -49,6 +49,8 @@ class TableMeta:
     columns: list[ColumnMeta] = field(default_factory=list)
     row_count: int | None = None
     foreign_keys: list[dict] = field(default_factory=list)  # [{column, ref_table, ref_column}]
+    create_time: dt.datetime | None = None    # 源库建表时间（方言相关，取不到留空）
+    storage_format: str | None = None         # 存储格式（Hive/Spark：TextFile/Parquet/ORC 等）
 
 
 @dataclass
@@ -238,8 +240,16 @@ class Connector(ABC):
         except Exception:
             pass
         tm.row_count = self._estimate_rows(name, schema)
+        try:
+            tm.create_time, tm.storage_format = self._table_storage_info(name, schema)
+        except Exception:  # 补采失败不阻塞主流程
+            pass
         self._attach_sidecar_comments(tm)
         return tm
+
+    def _table_storage_info(self, name: str, schema: str) -> tuple:
+        """补采「建表时间、存储格式」：方言相关，默认取不到留空（子类按方言覆盖）。"""
+        return None, None
 
     def _table_comment(self, insp, schema: str, name: str) -> str:
         if self.db_type == DbType.POSTGRESQL and schema:

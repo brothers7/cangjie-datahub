@@ -190,13 +190,37 @@ VITE_DEV_API=http://127.0.0.1:9111 npm run dev    # http://localhost:5173
 ## 🧪 测试与质量
 
 ```bash
-cd backend && .venv/bin/python -m pytest tests/     # 234 项测试
+cd backend && .venv/bin/python -m pytest tests/     # 287 项测试（含近期迭代新增）
+cd frontend && npm test                             # vitest 单元测试
 cd frontend && npx tsc --noEmit && npm run build
 ```
+
+CI 同时运行 ruff（宽松不阻塞）并在每个 PR 上构建前后端 Docker 镜像。
+
+---
+
+## 📚 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [docs/deployment.md](docs/deployment.md) | 生产部署清单：密钥修改、APP_ENV、反向代理/TLS、数据卷备份、升级与回滚 |
+| [docs/configuration.md](docs/configuration.md) | 全部环境变量参考表 |
+| [docs/operations.md](docs/operations.md) | 日志、健康检查（`/api/healthz` `/api/readyz`）、常见故障、告警 webhook |
+| [docs/architecture.md](docs/architecture.md) | 后端分层、调度引擎时序、前端结构 |
 
 ---
 
 ## 🗺 路线图
+
+近期迭代已完成：
+
+- [x] 健康检查端点（`/api/healthz` / `/api/readyz`）与容器 healthcheck
+- [x] Alembic 数据库迁移
+- [x] 前端单元测试（vitest）与 ESLint
+- [x] 多阶段非 root Docker 镜像 + CI 镜像构建
+- [x] 登录限流、悬挂扫描任务回收、调度补偿窗口、告警 webhook
+
+下一步：
 
 - [ ] 更多数仓（Trino/Presto、BigQuery、Snowflake）
 - [ ] 调度 Skill 示例市场（DolphinScheduler 等）

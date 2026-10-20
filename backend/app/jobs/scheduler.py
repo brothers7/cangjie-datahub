@@ -18,7 +18,6 @@ _DS_JOB_PREFIX = "ds_scan:"
 
 async def incremental_scan_datasource(datasource_id: str) -> None:
     """对单个数据源做增量扫描（meta_hash 差异跳过无变化表）。"""
-    from sqlalchemy import select
 
     from app.db.models import DataSource, ScanJob, ScanJobStatus, ScanMode
     from app.db.models.base import utcnow
@@ -134,6 +133,22 @@ async def scheduler_tick_job() -> None:
             await session.rollback()
 
 
+async def scheduler_catchup_job() -> None:
+    """停机补偿：启动/恢复时回补窗口内错过的 cron 时点（幂等，与 tick 共用去重键）。"""
+    from app.db.session import get_session_factory
+    from app.services import scheduler_engine
+
+    async with get_session_factory()() as session:
+        try:
+            stats = await scheduler_engine.catchup(session)
+            await session.commit()
+            if stats.get("created"):
+                logger.info("scheduler catchup: %s", stats)
+        except Exception:
+            logger.exception("scheduler catchup failed")
+            await session.rollback()
+
+
 async def purge_cache_job() -> None:
     from app.db.session import get_session_factory
     from app.services.cache_service import purge_expired
@@ -149,7 +164,9 @@ def start_scheduler() -> None:
     global _scheduler
     if _scheduler is not None:
         return
-    _scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
+    # 调度时区可配置（config 并行迭代补齐，未就位回退 Asia/Shanghai）
+    tz = getattr(settings, "app_tz", "Asia/Shanghai") or "Asia/Shanghai"
+    _scheduler = AsyncIOScheduler(timezone=tz)
     # 启动时载入各数据源 cron；之后数据源增删改时由 API 层调 refresh_scan_jobs
     _scheduler.add_job(refresh_scan_jobs, CronTrigger(minute=0), id="refresh_scan_jobs",
                        max_instances=1, coalesce=True)
@@ -161,11 +178,15 @@ def start_scheduler() -> None:
                        max_instances=1, coalesce=True)
     _scheduler.start()
     asyncio.get_event_loop().create_task(refresh_scan_jobs())
+    # 启动/恢复时做一次停机补偿（回补窗口内错过的 cron 时点）
+    asyncio.get_event_loop().create_task(scheduler_catchup_job())
     logger.info("scheduler started")
 
 
 def stop_scheduler() -> None:
     global _scheduler
     if _scheduler is not None:
-        _scheduler.shutdown(wait=False)
+        # wait=True：优雅停机，有界等待在途任务收尾（避免进程退出时实例停在
+        # running 半态）；等待上限由各任务自身超时（query_timeout 等）兜底
+        _scheduler.shutdown(wait=True)
         _scheduler = None

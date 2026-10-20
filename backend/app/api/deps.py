@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import uuid as _uuid
 
-import jwt as pyjwt
 from fastapi import Depends, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,9 +14,11 @@ from app.db.session import get_db
 
 
 async def get_current_user(request: Request, db: AsyncSession = Depends(get_db)) -> User:
+    # 优先 Authorization 头（标准方式；SSE 前端经 fetch/EventSource 封装带 header）。
     token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     if not token:
-        # SSE 场景允许 query token
+        # 兼容（已废弃，过渡期保留）：SSE 场景从 query 参数取 token。
+        # query token 会进入访问日志/浏览器历史，有泄露风险，前端迁完后移除此分支。
         token = request.query_params.get("token", "")
     if not token:
         raise AuthError("未登录")

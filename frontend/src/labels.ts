@@ -147,14 +147,3 @@ export const callStatusLabel = (key: string, lang: Lang): string => CALL_STATUS_
 
 export const queryStatus = (status: string, lang: Lang): { text: string; cls: string } | undefined =>
   QUERY_STATUS_I18N[lang][status]
-
-// ---------- 兼容导出：保持旧的默认中文行为，避免破坏未改造页面 ----------
-
-/** @deprecated 请使用 sceneLabels(lang) */
-export const SCENE_LABELS: Record<string, string> = SCENE_LABELS_I18N.zh
-/** @deprecated 请使用 auditActions(lang) */
-export const AUDIT_ACTIONS: Record<string, string> = AUDIT_ACTIONS_I18N.zh
-/** @deprecated 请使用 callStatusLabels(lang) */
-export const CALL_STATUS_LABELS: Record<string, string> = CALL_STATUS_LABELS_I18N.zh
-/** @deprecated 请使用 queryStatus(status, lang) */
-export const QUERY_STATUS: Record<string, { text: string; cls: string }> = QUERY_STATUS_I18N.zh

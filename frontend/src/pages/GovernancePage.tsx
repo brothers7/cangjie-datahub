@@ -1,9 +1,9 @@
 /** AI 数据治理（PRD 3.3F）：六域巡检 + AI 治理报告 + 治理项转任务/修订 + 质量探查。 */
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { api, ApiError } from '@/api/client'
+import { api, ApiError, tokenStore } from '@/api/client'
 import { Markdown } from '@/components/common/Markdown'
-import { Confirm, Empty, relTime, Spinner } from '@/components/common/ui'
+import { Confirm, Drawer, Empty, relTime, Spinner } from '@/components/common/ui'
 import { useI18n } from '@/i18n'
 import { useApp, toast } from '@/stores/app'
 import type { GovernanceFinding, GovernanceRunRow } from '@/types'
@@ -11,6 +11,35 @@ import type { GovernanceFinding, GovernanceRunRow } from '@/types'
 const LEVEL_CLS: Record<string, string> = { block: 'danger', warn: 'warn', info: '' }
 const DOMAIN_KEYS = new Set(['metadata', 'model', 'schedule', 'quality', 'security', 'cost'])
 const LEVEL_KEYS = new Set(['block', 'warn', 'info'])
+
+// ---- 探查留档（GET /governance/probes）：client.ts 暂无 getGovernanceProbes 类方法（归另一 agent），
+// 这里按其 request 封装同风格用 fetch + tokenStore 直连 REST 路径；待 client 补齐后可迁移。
+interface ProbeRow {
+  id: string
+  created_at: string
+  datasource_id?: string
+  datasource_name?: string
+  table: string
+  username?: string
+  finding_count?: number
+  summary?: string
+}
+interface ProbeDetail extends ProbeRow {
+  stats: Record<string, { distinct: number; non_null: number }>
+  findings: { level: string; column: string; issue: string; suggestion: string }[]
+}
+async function govGet<T>(path: string): Promise<T> {
+  const headers: Record<string, string> = {}
+  const token = tokenStore.get()
+  if (token) headers.Authorization = `Bearer ${token}`
+  const resp = await fetch(`/api/v1${path}`, { headers })
+  const data = await resp.json().catch(() => ({})) as { message?: string; code?: string }
+  if (!resp.ok) throw new ApiError(data.message || `请求失败 (${resp.status})`, data.code || 'HTTP_ERROR', resp.status)
+  return data as unknown as T
+}
+const listGovernanceProbes = (page: number, pageSize: number) =>
+  govGet<{ total: number; page: number; rows: ProbeRow[] }>(`/governance/probes?page=${page}&page_size=${pageSize}`)
+const getGovernanceProbe = (id: string) => govGet<ProbeDetail>(`/governance/probes/${id}`)
 
 export default function GovernancePage() {
   const { t, lang } = useI18n()
@@ -29,6 +58,14 @@ export default function GovernancePage() {
   } | null>(null)
   const [probing, setProbing] = useState(false)
   const [gotoTask, setGotoTask] = useState<string | null>(null)
+  // 探查留档
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [probeRows, setProbeRows] = useState<ProbeRow[]>([])
+  const [probeTotal, setProbeTotal] = useState(0)
+  const [probePage, setProbePage] = useState(1)
+  const [probeDetail, setProbeDetail] = useState<ProbeDetail | null>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
+  const PROBE_PAGE_SIZE = 10
 
   const domainLabel = (d: string) => (DOMAIN_KEYS.has(d) ? t(`gov.domain.${d}`) : d)
   const domainShort = (d: string) => (DOMAIN_KEYS.has(d) ? t(`gov.domainShort.${d}`) : d.slice(0, 2))
@@ -75,8 +112,30 @@ export default function GovernancePage() {
       const r = await api.governanceProbe({ datasource_id: probeDs, table: probeTable.trim() })
       setProbeResult(r)
       if (!r.findings.length) toast.ok(t('gov.probeClean'))
+      // 新探查会落留档，历史面板展开时同步刷新第一页
+      if (historyOpen) { setProbePage(1); void loadProbes(1) }
     } catch (e) { toast.error((e as ApiError).message) } finally { setProbing(false) }
   }
+
+  // 探查留档：分页加载 + 详情查看
+  const loadProbes = useCallback(async (page: number) => {
+    try {
+      const r = await listGovernanceProbes(page, PROBE_PAGE_SIZE)
+      setProbeRows(r.rows || [])
+      setProbeTotal(r.total || 0)
+    } catch (e) { toast.error((e as ApiError).message) }
+  }, [])
+  useEffect(() => { if (historyOpen) void loadProbes(probePage) }, [historyOpen, probePage, loadProbes])
+
+  const openProbe = async (id: string) => {
+    setDetailLoading(true)
+    setProbeDetail(null)
+    try { setProbeDetail(await getGovernanceProbe(id)) }
+    catch (e) { toast.error((e as ApiError).message) } finally { setDetailLoading(false) }
+  }
+
+  const dsName = (r: ProbeRow) =>
+    r.datasource_name || datasources.find((d) => d.id === r.datasource_id)?.name || '-'
 
   const findings = (active?.findings || []).filter((f) => !domainFilter || f.domain === domainFilter)
 
@@ -174,49 +233,117 @@ export default function GovernancePage() {
           )}
         </div>
 
-        {/* 质量探查 */}
-        <div className="card" style={{ width: 320, flexShrink: 0 }}>
-          <div className="card-body">
-            <b>{t('gov.probeTitle')}</b>
-            <div className="tiny muted mt8">{t('gov.probeDesc')}</div>
-            <select className="input mt8" value={probeDs} onChange={(e) => setProbeDs(e.target.value)}>
-              <option value="">{t('gov.probeSelectDs')}</option>
-              {datasources.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
-            </select>
-            <input className="input mt8" placeholder={t('gov.probeTablePh')} value={probeTable}
-              onChange={(e) => setProbeTable(e.target.value)} />
-            <button className="btn primary mt8" style={{ width: '100%' }} disabled={probing}
-              onClick={() => void probe()}>{probing ? t('gov.probing') : t('gov.probeRun')}</button>
+        {/* 质量探查 + 探查留档 */}
+        <div className="col" style={{ width: 320, flexShrink: 0, gap: 16 }}>
+          <div className="card">
+            <div className="card-body">
+              <b>{t('gov.probeTitle')}</b>
+              <div className="tiny muted mt8">{t('gov.probeDesc')}</div>
+              <select className="input mt8" value={probeDs} onChange={(e) => setProbeDs(e.target.value)}>
+                <option value="">{t('gov.probeSelectDs')}</option>
+                {datasources.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
+              </select>
+              <input className="input mt8" placeholder={t('gov.probeTablePh')} value={probeTable}
+                onChange={(e) => setProbeTable(e.target.value)} />
+              <button className="btn primary mt8" style={{ width: '100%' }} disabled={probing}
+                onClick={() => void probe()}>{probing ? t('gov.probing') : t('gov.probeRun')}</button>
 
-            {probeResult && (
-              <div className="mt12 col" style={{ gap: 6 }}>
-                {probeResult.findings.map((f, i) => (
-                  <div key={i} className="tiny">
-                    <span className={`tag tiny ${LEVEL_CLS[f.level] || ''}`}>{LEVEL_KEYS.has(f.level) ? t(`gov.level.${f.level}`) : f.level}</span>{' '}
-                    {f.issue}
-                    <div className="muted" style={{ marginLeft: 4 }}>💡 {f.suggestion}</div>
-                  </div>
-                ))}
-                <div className="tiny dim mt8">{t('gov.sampleStats')}</div>
-                <table className="tbl" style={{ fontSize: 12 }}>
-                  <thead><tr><th>{t('gov.colField')}</th><th>{t('gov.colNonNull')}</th><th>{t('gov.colDistinct')}</th></tr></thead>
-                  <tbody>
-                    {Object.entries(probeResult.stats).map(([c, s]) => (
-                      <tr key={c}><td><code>{c}</code></td><td>{s.non_null}</td><td>{s.distinct}</td></tr>
-                    ))}
-                  </tbody>
-                </table>
+              {probeResult && (
+                <div className="mt12">
+                  <ProbeResultView result={probeResult} levelLabel={levelLabel} />
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* 探查留档（GET /governance/probes 分页列表，点击查看详情） */}
+          <div className="card">
+            <div className="card-body" style={{ padding: 12 }}>
+              <div className="row" style={{ cursor: 'pointer' }} onClick={() => setHistoryOpen((v) => !v)}>
+                <b>{t('gov.probeHistory')}</b>
+                <span className="spacer" />
+                <span className="tiny muted">{historyOpen ? '▾' : '▸'}</span>
               </div>
-            )}
+              {historyOpen && (
+                <div className="mt8 col" style={{ gap: 4 }}>
+                  {probeRows.map((r) => (
+                    <div key={r.id} className="conv" style={{ padding: '6px 8px', cursor: 'pointer', borderRadius: 6 }}
+                      onClick={() => void openProbe(r.id)}>
+                      <div className="t tiny">{relTime(r.created_at, t)}
+                        <span className="muted"> · {r.username || '-'}</span></div>
+                      <div className="d tiny muted">{dsName(r)} · <code>{r.table}</code></div>
+                      <div className="d tiny dim truncate">
+                        {r.summary || (typeof r.finding_count === 'number' ? t('gov.findingCount', { n: r.finding_count }) : '')}
+                      </div>
+                    </div>
+                  ))}
+                  {!probeRows.length && <Empty icon="🧪" text={t('gov.noProbes')} />}
+                  <div className="row tiny mt8" style={{ gap: 6 }}>
+                    <button className="btn sm" disabled={probePage <= 1}
+                      onClick={() => setProbePage((p) => p - 1)}>{t('common.prevPage')}</button>
+                    <span className="muted">{t('common.page', { n: probePage })}</span>
+                    <button className="btn sm" disabled={probePage * PROBE_PAGE_SIZE >= probeTotal}
+                      onClick={() => setProbePage((p) => p + 1)}>{t('common.nextPage')}</button>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </div>
+      {(detailLoading || probeDetail) && (
+        <Drawer title={t('gov.probeDetailTitle')}
+          sub={probeDetail ? `${dsName(probeDetail)} · ${probeDetail.table}` : ''}
+          onClose={() => { setProbeDetail(null); setDetailLoading(false) }}>
+          {detailLoading && <Spinner text={t('gov.probing')} />}
+          {probeDetail && (
+            <>
+              <div className="tiny muted mb8">
+                {relTime(probeDetail.created_at, t)} · {probeDetail.username || '-'}
+              </div>
+              <ProbeResultView result={probeDetail} levelLabel={levelLabel} />
+            </>
+          )}
+        </Drawer>
+      )}
       {gotoTask && (
         <Confirm title={t('gov.taskDraftCreated')}
           text={t('gov.gotoModeling')}
           onCancel={() => setGotoTask(null)}
           onOk={() => { const id = gotoTask; setGotoTask(null); nav(`/modeling?task=${id}`) }} />
       )}
+    </div>
+  )
+}
+
+/** 探查结果展示：在线探查结果与留档详情共用（stats/findings 渲染）。 */
+function ProbeResultView({ result, levelLabel }: {
+  result: {
+    stats: Record<string, { distinct: number; non_null: number }>
+    findings: { level: string; column: string; issue: string; suggestion: string }[]
+  }
+  levelLabel: (l: string) => string
+}) {
+  const { t } = useI18n()
+  return (
+    <div className="col" style={{ gap: 6 }}>
+      {(result.findings || []).map((f, i) => (
+        <div key={i} className="tiny">
+          <span className={`tag tiny ${LEVEL_CLS[f.level] || ''}`}>{levelLabel(f.level)}</span>{' '}
+          {f.issue}
+          <div className="muted" style={{ marginLeft: 4 }}>💡 {f.suggestion}</div>
+        </div>
+      ))}
+      {!result.findings?.length && <div className="tiny muted">{t('gov.probeClean')}</div>}
+      <div className="tiny dim mt8">{t('gov.sampleStats')}</div>
+      <table className="tbl" style={{ fontSize: 12 }}>
+        <thead><tr><th>{t('gov.colField')}</th><th>{t('gov.colNonNull')}</th><th>{t('gov.colDistinct')}</th></tr></thead>
+        <tbody>
+          {Object.entries(result.stats || {}).map(([c, s]) => (
+            <tr key={c}><td><code>{c}</code></td><td>{s.non_null}</td><td>{s.distinct}</td></tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   )
 }

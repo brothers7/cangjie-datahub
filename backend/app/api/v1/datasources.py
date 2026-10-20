@@ -11,10 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import accessible_datasource_ids, get_current_user, require_admin
 from app.connectors.registry import get_connector
-from app.core.crypto import decrypt, encrypt
+from app.core.crypto import encrypt
 from app.core.errors import AppError, DatasourceError, NotFoundError, PermissionDenied, ValidationError
 from app.db.models import (AuditLog, DataSource, DsStatus, DbType, MaskStrategy, MaskingRule,
-                           MetaColumn, MetaTable, ScanJob, ScanJobStatus, ScanMode, SourceKind)
+                           MetaColumn, MetaTable, ScanJob, ScanJobStatus, ScanMode)
 from app.db.models.base import utcnow
 from app.db.session import get_db, get_session_factory
 from app.metadata.scanner import scan_datasource

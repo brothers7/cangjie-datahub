@@ -12,6 +12,21 @@ import type { LlmCallLog, LlmConfig, SceneBindings, UsageRow } from '@/types'
 /** 健康检查 / 连通性测试结果（文案按当前语言渲染，避免依赖中文字符串判断状态） */
 interface HealthState { ok: boolean; checking?: boolean; latency?: number | null; message?: string }
 
+/** 近 15 分钟失败率告警徽标：字段缺失、无调用或低于阈值（20%）时不显示 */
+function FailRateBadge({ config }: { config: LlmConfig }) {
+  const { t } = useI18n()
+  const ext = config as LlmConfig & { failure_rate_15m?: number | null; calls_15m?: number | null }
+  const rate = ext.failure_rate_15m
+  if (rate === undefined || rate === null || rate <= 0.2) return null
+  if (ext.calls_15m === 0) return null
+  const pct = (rate * 100).toFixed(0)
+  return (
+    <span className="tag warn" title={t('admin.llm.failRateTitle', { n: pct })}>
+      ⚠ {t('admin.llm.failRateBadge', { n: pct })}
+    </span>
+  )
+}
+
 const PRESETS: Record<string, { endpoint: string; model: string }[]> = {
   openai: [
     { endpoint: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
@@ -119,6 +134,7 @@ export default function LlmConfigPage() {
                               {t('admin.llm.fallbackTag', { name: configs.find((x) => x.id === c.fallback_config_id)?.name || t('admin.llm.deletedName') })}
                             </span>
                           )}
+                          <FailRateBadge config={c} />
                         </div>
                         <div className="tiny muted mt8">
                           {c.endpoint} · <span className="mono">{c.model}</span> · temp {c.temperature} ·
@@ -312,6 +328,7 @@ function UsagePanel() {
         },
       ],
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- themeTick 是有意依赖：主题切换重建 option
   }, [rows, t, themeTick])
 
   if (loading) return <div className="center" style={{ padding: 40 }}><Spinner text={t('admin.llm.loadingUsage')} /></div>
@@ -471,7 +488,8 @@ function ConfigEditor({ config, all, onClose, onSaved }: {
         toast.ok(t('admin.llm.configCreatedTesting'))
         try {
           const r = await api.healthCheckLlm(created.id)
-          r.ok ? toast.ok(t('admin.llm.connectivityOk', { n: r.latency_ms ?? '-' })) : toast.warn(t('admin.llm.connectivityFail', { msg: r.message }))
+          if (r.ok) toast.ok(t('admin.llm.connectivityOk', { n: r.latency_ms ?? '-' }))
+          else toast.warn(t('admin.llm.connectivityFail', { msg: r.message }))
         } catch { /* 忽略 */ }
       }
       onSaved()

@@ -8,7 +8,7 @@ from sqlalchemy import delete, select
 
 from app.core.config import settings
 from app.db.models import QueryCache
-from app.db.models.base import as_utc, utcnow
+from app.db.models.base import utcnow
 
 
 def cache_key(datasource_id: str, sql: str) -> str:

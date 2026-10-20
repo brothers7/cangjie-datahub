@@ -240,6 +240,10 @@ export const api = {
   setSkillStatus: (id: string, status: 'enabled' | 'disabled') =>
     request<CustomSkillRow>(`/skills/${id}/status`, { method: 'POST', body: JSON.stringify({ status }) }),
   deleteSkill: (id: string) => request<{ ok: boolean }>(`/skills/${id}`, { method: 'DELETE' }),
+  // Skill 版本回滚：把指定历史版本置为启用；target_version 缺省时由后端决定目标版本
+  rollbackSkill: (id: string, targetVersion?: number) =>
+    request<CustomSkillRow>(`/skills/${id}/rollback`,
+      { method: 'POST', body: JSON.stringify(targetVersion ? { target_version: targetVersion } : {}) }),
 
   // ---- 自动化建模（ETL 任务 / 全景 / 建议 / 编辑器） ----
   listEtlTasks: () => request<EtlTaskRow[]>('/etl/tasks'),
@@ -272,9 +276,11 @@ export const api = {
   // ---- 内置调度平台（PRD 3.3G） ----
   schedulerRuns: (taskId = '') =>
     request<{ runs: SchedulerRunRow[] }>(`/scheduler/runs${qs({ task_id: taskId })}`),
-  triggerTask: (id: string, ds = '') =>
-    request<{ run: SchedulerRunRow }>(`/scheduler/tasks/${id}/trigger`,
-      { method: 'POST', body: JSON.stringify({ ds }) }),
+  // 内置调度触发：cascade=true 时级联触发下游任务；级联时响应可能带多任务清单（runs/cascaded）
+  triggerTask: (id: string, ds = '', cascade = false) =>
+    request<{ run: SchedulerRunRow; runs?: SchedulerRunRow[]; cascaded?: SchedulerRunRow[] }>(
+      `/scheduler/tasks/${id}/trigger`,
+      { method: 'POST', body: JSON.stringify({ ds, cascade }) }),
   retrySchedulerRun: (id: string) =>
     request<{ run: SchedulerRunRow }>(`/scheduler/runs/${id}/retry`, { method: 'POST' }),
   approveTask: (id: string) =>

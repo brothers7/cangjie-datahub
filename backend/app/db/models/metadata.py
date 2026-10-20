@@ -65,6 +65,8 @@ class MetaTable(UUIDMixin, TimestampMixin, Base):
     )
     edited_fields: Mapped[list] = mapped_column(JSONType, default=list)
     last_seen_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    create_time: Mapped[datetime | None] = mapped_column(UTCDateTime())  # 源库建表时间（取不到留空）
+    storage_format: Mapped[str | None] = mapped_column(sa.String(64), default=None)  # TextFile/Parquet/ORC 等
 
 
 class MetaColumn(UUIDMixin, TimestampMixin, Base):

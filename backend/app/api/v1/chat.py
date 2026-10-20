@@ -14,7 +14,6 @@ from app.agent.pipeline.orchestrator import start_pipeline
 from app.api.deps import can_access_datasource, get_current_user
 from app.core.errors import NotFoundError, PermissionDenied, ValidationError
 from app.db.models import Conversation, DataSource, Message, User
-from app.db.models.base import utcnow
 from app.db.session import get_db
 from app.schemas.entities import ConversationCreateIn, MessageIn
 

@@ -1,7 +1,6 @@
 """短时记忆：会话级上下文（多轮追问不丢失，PRD 4.3）。"""
 from __future__ import annotations
 
-from sqlalchemy import select
 
 from app.db.models import Conversation
 from app.db.models.base import utcnow

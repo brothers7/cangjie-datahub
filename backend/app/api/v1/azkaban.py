@@ -18,7 +18,6 @@ from app.api.deps import get_current_user, require_admin
 from app.core.crypto import encrypt
 from app.core.errors import ValidationError
 from app.db.models import AuditLog, AzkabanConfig, IntegrationStatus
-from app.db.models.base import utcnow
 from app.db.session import get_db
 from app.services import azkaban as azk
 

@@ -27,7 +27,23 @@ SCENES = [s.value for s in LlmScene]
 @router.get("/configs", response_model=list[LlmConfigOut])
 async def list_configs(db: AsyncSession = Depends(get_db), _=Depends(require_admin)):
     rows = (await db.execute(select(LlmConfig).order_by(LlmConfig.created_at))).scalars().all()
-    return rows
+    # 近 15 分钟各配置失败率（一次分组聚合），供前端告警徽标展示
+    since_15m = utcnow() - timedelta(minutes=15)
+    stats = dict((cid, (int(c), int(e))) for cid, c, e in (await db.execute(
+        select(LlmCallLog.config_id,
+               func.count(LlmCallLog.id),
+               func.coalesce(func.sum(
+                   case((LlmCallLog.status != CallStatus.OK, 1), else_=0)), 0))
+        .where(LlmCallLog.created_at >= since_15m)
+        .group_by(LlmCallLog.config_id))).all())
+    out = []
+    for r in rows:
+        item = LlmConfigOut.model_validate(r).model_dump()
+        calls, errors = stats.get(r.id, (0, 0))
+        item["calls_15m"] = calls
+        item["failure_rate_15m"] = round(errors / calls, 4) if calls else None
+        out.append(item)
+    return out
 
 
 @router.get("/chat-options")
@@ -197,11 +213,21 @@ async def usage(group_by: str = "day", days: int = 14,
          .where(LlmCallLog.created_at >= since)
          .group_by("k").order_by("k"))
     rows = (await db.execute(q)).all()
+    # 近 15 分钟失败率：前端配置卡徽标用（独立聚合，向后兼容地附加在响应顶层）
+    since_15m = utcnow() - timedelta(minutes=15)
+    calls_15m, errors_15m = (await db.execute(
+        select(func.count(LlmCallLog.id),
+               func.coalesce(func.sum(
+                   case((LlmCallLog.status != CallStatus.OK, 1), else_=0)), 0))
+        .where(LlmCallLog.created_at >= since_15m))).one()
     return {"group_by": group_by,
             "rows": [{"key": str(k)[:10] if group_by == "day" else str(k),
                       "input_tokens": int(it), "output_tokens": int(ot),
                       "calls": int(c), "errors": int(e)}
-                     for k, it, ot, c, e in rows]}
+                     for k, it, ot, c, e in rows],
+            "recent_15m": {"calls": int(calls_15m), "errors": int(errors_15m),
+                           "failure_rate": (round(int(errors_15m) / int(calls_15m), 4)
+                                            if calls_15m else 0.0)}}
 
 
 @router.get("/call-logs")

@@ -191,13 +191,37 @@ Log in as admin → **LLM Config** → add an OpenAI or Anthropic compatible end
 ## 🧪 Tests & Quality
 
 ```bash
-cd backend && .venv/bin/python -m pytest tests/     # 234 tests
+cd backend && .venv/bin/python -m pytest tests/     # 287 tests (incl. tests added in recent iterations)
+cd frontend && npm test                             # vitest unit tests
 cd frontend && npx tsc --noEmit && npm run build
 ```
+
+CI also runs ruff (non-blocking) and builds both Docker images on every PR.
+
+---
+
+## 📚 Documentation
+
+| Doc | Contents |
+| --- | --- |
+| [docs/deployment.md](docs/deployment.md) | Production checklist: secrets, `APP_ENV`, reverse proxy/TLS, volume backup, upgrade & rollback |
+| [docs/configuration.md](docs/configuration.md) | Full environment variable reference |
+| [docs/operations.md](docs/operations.md) | Logs, health checks (`/api/healthz` `/api/readyz`), troubleshooting, alert webhook |
+| [docs/architecture.md](docs/architecture.md) | Backend layering, scheduler timing, frontend structure |
 
 ---
 
 ## 🗺 Roadmap
+
+Done in recent iterations:
+
+- [x] Health endpoints (`/api/healthz` / `/api/readyz`) + container healthchecks
+- [x] Alembic database migrations
+- [x] Frontend unit tests (vitest) & ESLint
+- [x] Multi-stage, non-root Docker images + CI image builds
+- [x] Login rate limiting, stale scan-job reaping, scheduler catch-up window, alert webhook
+
+Next:
 
 - [ ] More warehouses (Trino/Presto, BigQuery, Snowflake)
 - [ ] Scheduler skill marketplace samples (DolphinScheduler, Airflow REST v2)

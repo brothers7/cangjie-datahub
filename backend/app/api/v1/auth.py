@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.core.config import settings
 from app.core.errors import AuthError
 from app.core.security import create_token, verify_password
 from app.db.models import AuditLog, User, UserStatus
@@ -16,9 +17,9 @@ from app.schemas.entities import LoginIn, TokenOut
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-# 登录失败限流（PRD 4.4）：连续 5 次密码错误锁定 10 分钟，防暴力破解
-MAX_LOGIN_FAILS = 5
-LOCK_MINUTES = 10
+# 登录失败限流（PRD 4.4）：连续密码错误达到上限即锁定，防暴力破解；阈值走 settings 可调
+MAX_LOGIN_FAILS = settings.login_max_fails
+LOCK_MINUTES = settings.login_lock_minutes
 
 # 时序防枚举：不存在的账号也执行一次 argon2 校验（对预生成的假 hash），
 # 使响应耗时不泄露账号是否存在。该 hash 不对应任何真实账号。

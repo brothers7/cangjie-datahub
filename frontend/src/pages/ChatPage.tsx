@@ -513,7 +513,7 @@ const MessageBubble = memo(function MessageBubble({ msg, onOpenReport, onConfirm
 
         {view.pendingConfirm && view.pendingConfirm.length > 0 && (
           <ConfirmPrompt candidates={view.pendingConfirm}
-            onPick={(id, name) => {
+            onPick={(id, _name) => {
               const q = msg.payload?.rewritten || ''
               if (!q.trim()) { toast.warn(t('chat.confirmExpired')); return }
               onConfirm(q, id)

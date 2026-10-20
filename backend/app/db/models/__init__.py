@@ -8,7 +8,7 @@ from app.db.models.integration import (AirflowConfig, AzkabanConfig, CustomSkill
                                        IntegrationStatus, ModelingMessage, ModelingSession,
                                        ModelingSessionStatus, SchedulerRun, SchedulerRunStatus,
                                        SkillStatus, SkillType)
-from app.db.models.governance import DwStandard, GovernanceRun
+from app.db.models.governance import DwStandard, GovernanceRun, ProbeRun
 from app.db.models.job import AuditLog, ScanJob, ScanJobStatus, ScanMode
 from app.db.models.kg import (DimensionType, EdgeType, EntityType, KgDimension, KgEdge, KgMetric,
                               KgValidationRule, MetricStatus, RuleSeverity, RuleType)
@@ -43,5 +43,5 @@ __all__ = [
     "EtlTask", "EtlTaskStatus", "EtlTaskSource", "EtlTaskVersion",
     "ModelingSession", "ModelingSessionStatus", "ModelingMessage",
     # governance / dw standards
-    "DwStandard", "GovernanceRun",
+    "DwStandard", "GovernanceRun", "ProbeRun",
 ]

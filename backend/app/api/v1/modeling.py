@@ -99,12 +99,49 @@ async def overview(db: AsyncSession = Depends(get_db), user=Depends(get_current_
 
 # ---------- 任务元数据（统一搜索，PRD 3.3D-4） ----------
 
+# Azkaban 远端 flow 清单缓存：搜索按关键词本地过滤，不每关键词全量打远端
+_AZK_FLOW_CACHE: dict = {"at": 0.0, "flows": []}
+_AZK_FLOW_CACHE_TTL = 60.0  # 秒
+
+
+async def _fetch_azkaban_flows(db: AsyncSession) -> list[dict]:
+    """拉取 Azkaban 远端 flow 清单（带 60s 进程内缓存）。
+
+    未配置/连接失败返回空列表（优雅跳过该类别，不影响本地搜索）。
+    返回 [{project, flow, cron?}]。
+    """
+    import time as _time
+
+    from app.db.models import AzkabanConfig
+    from app.services import azkaban as azk
+
+    now = _time.monotonic()
+    if now - _AZK_FLOW_CACHE["at"] < _AZK_FLOW_CACHE_TTL:
+        return list(_AZK_FLOW_CACHE["flows"])
+    flows: list[dict] = []
+    try:
+        cfg = (await db.execute(
+            select(AzkabanConfig).order_by(AzkabanConfig.created_at.desc()).limit(1)
+        )).scalar_one_or_none()
+        if cfg is not None and cfg.url:
+            client = azk.client_from_config(cfg)
+            for p in (await client.list_projects())[:10]:
+                for f in (await client.list_flows(p["name"]))[:50]:
+                    flows.append({"project": p["name"], "flow": f})
+    except Exception:
+        flows = []  # 远端不可达：跳过该类别
+    _AZK_FLOW_CACHE["at"] = now
+    _AZK_FLOW_CACHE["flows"] = flows
+    return list(flows)
+
+
 @router.get("/task-metadata")
 async def task_metadata(q: str = "", db: AsyncSession = Depends(get_db),
                         user=Depends(get_current_user)):
-    """任务元数据页：本地建模任务 + 表元数据，统一模糊搜索（名称/注释/目标表）。
+    """任务元数据页：本地建模任务 + 表元数据 + Azkaban 远端 flow，统一模糊搜索。
 
-    权限：任务仅本人（管理员全量）；表元数据按数据源权限过滤。
+    权限：任务仅本人（管理员全量）；表元数据按数据源权限过滤；
+    Azkaban flow 仅管理员可见（连接配置属平台级资产）。
     """
     kw = q.strip()
     like = like_contains(kw)
@@ -135,6 +172,18 @@ async def task_metadata(q: str = "", db: AsyncSession = Depends(get_db),
             .group_by(MetaColumn.table_id))).all()
         col_counts = {str(r[0]): r[1] for r in rows}
 
+    # Azkaban 远端 flow：有关键词时从缓存清单本地过滤（未配置/失败时为空）；仅管理员可见
+    azkaban_flows: list[dict] = []
+    if kw and user.role == Role.ADMIN:
+        try:
+            kw_l = kw.lower()
+            azkaban_flows = [
+                {**f, "matched": True} for f in await _fetch_azkaban_flows(db)
+                if kw_l in f["flow"].lower() or kw_l in f["project"].lower()
+            ][:30]
+        except Exception:
+            azkaban_flows = []  # 远端异常不影响本地搜索
+
     return {
         "tasks": [{"id": str(x.id), "name": x.name, "target_table": x.target_table,
                    "layer": x.layer, "cron": x.cron, "status": x.status.value,
@@ -146,6 +195,7 @@ async def task_metadata(q: str = "", db: AsyncSession = Depends(get_db),
                     "comment": x.comment or "", "partition_cols": x.partition_cols or [],
                     "row_count": x.row_count, "col_count": col_counts.get(str(x.id), 0)}
                    for x in tables],
+        "azkaban_flows": azkaban_flows,
     }
 
 
@@ -153,29 +203,48 @@ async def task_metadata(q: str = "", db: AsyncSession = Depends(get_db),
 
 @router.post("/advice")
 async def advice(db: AsyncSession = Depends(get_db), user=Depends(get_current_user)):
-    """建模规划建议：规则健康度结论（必有）+ LLM 规划报告（可选增强）。"""
+    """建模规划建议：规则健康度结论（必有）+ LLM 规划报告（可选增强）。
+
+    每条 finding 带 suggested_task 可行动字段（{name, layer, target_table, reason}），
+    规则能推断则填，推断不了的字段留空；整体无法推断时 suggested_task 为 None。
+    """
     ov = await overview(db, user)
     findings: list[dict] = []
 
+    def _finding(level: str, title: str, detail: str,
+                 suggested_task: dict | None = None) -> dict:
+        return {"level": level, "title": title, "detail": detail,
+                "suggested_task": suggested_task}
+
     if ov["uncommented_ratio"] > 0.3:
-        findings.append({"level": "warn", "title": "注释覆盖率低",
-                         "detail": f"{ov['uncommented']}/{ov['table_total']} 张表无注释，"
-                                   "库表答疑与 AI 建模的准确性会受影响，建议先补齐核心表注释"})
+        findings.append(_finding("warn", "注释覆盖率低",
+                                 f"{ov['uncommented']}/{ov['table_total']} 张表无注释，"
+                                 "库表答疑与 AI 建模的准确性会受影响，建议先补齐核心表注释"))
     if ov["isolated_tables"]:
-        findings.append({"level": "warn", "title": "存在孤岛表",
-                         "detail": f"{len(ov['isolated_tables'])} 张表没有任何表关系登记："
-                                   f"{ '、'.join(ov['isolated_tables'][:8]) }…，跨表分析无法路由"})
+        findings.append(_finding("warn", "存在孤岛表",
+                                 f"{len(ov['isolated_tables'])} 张表没有任何表关系登记："
+                                 f"{ '、'.join(ov['isolated_tables'][:8]) }…，跨表分析无法路由"))
     if ov["by_layer"].get("dwd") and not ov["by_layer"].get("dws"):
-        findings.append({"level": "block", "title": "缺失 DWS 汇总层",
-                         "detail": "存在明细层但没有汇总层，高频聚合查询会反复扫明细，"
-                                   "建议按核心业务域（交易/用户/商品）建 DWS 日汇总表"})
+        findings.append(_finding(
+            "block", "缺失 DWS 汇总层",
+            "存在明细层但没有汇总层，高频聚合查询会反复扫明细，"
+            "建议按核心业务域（交易/用户/商品）建 DWS 日汇总表",
+            suggested_task={"name": "新建 DWS 日汇总表", "layer": "dws",
+                            "target_table": "",   # 目标表名需按业务域定，规则推断不了
+                            "reason": "存在 DWD 明细层但无 DWS 汇总层，高频聚合反复扫明细"}))
     if ov["no_task_tables"]:
-        findings.append({"level": "info", "title": "汇总表无调度任务",
-                         "detail": f"{len(ov['no_task_tables'])} 张 DWS/ADS 表没有对应加工任务："
-                                   f"{ '、'.join(ov['no_task_tables'][:8]) }…，数据可能不是最新"})
+        first_table = ov["no_task_tables"][0]
+        findings.append(_finding(
+            "info", "汇总表无调度任务",
+            f"{len(ov['no_task_tables'])} 张 DWS/ADS 表没有对应加工任务："
+            f"{ '、'.join(ov['no_task_tables'][:8]) }…，数据可能不是最新",
+            suggested_task={"name": f"加工 {first_table}",
+                            "layer": first_table.split("_")[0] if "_" in first_table else "",
+                            "target_table": first_table,
+                            "reason": "该汇总层表存在但没有加工任务，数据不会更新"}))
     if not findings:
-        findings.append({"level": "ok", "title": "模型健康",
-                         "detail": "分层完整、注释覆盖率与调度覆盖良好，无显著结构性问题"})
+        findings.append(_finding("ok", "模型健康",
+                                 "分层完整、注释覆盖率与调度覆盖良好，无显著结构性问题"))
 
     # LLM 规划报告（失败不影响规则结论）
     report = ""

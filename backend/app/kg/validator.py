@@ -5,7 +5,7 @@ import uuid
 
 from sqlalchemy import select
 
-from app.db.models import (EdgeType, EntityType, KgDimension, KgEdge, KgMetric,
+from app.db.models import (EdgeType, EntityType, KgEdge, KgMetric,
                            KgValidationRule, MetaColumn, MetaTable, MetricStatus,
                            RuleSeverity, RuleType, SemanticRole, SourceKind)
 
@@ -15,12 +15,10 @@ async def run_validation(session, datasource_id: uuid.UUID | None = None) -> lis
     issues: list[dict] = []
 
     metrics_q = select(KgMetric).where(KgMetric.status == MetricStatus.ACTIVE)
-    dims_q = select(KgDimension).where(KgDimension.status == MetricStatus.ACTIVE)
     if datasource_id:
         metrics_q = metrics_q.where(KgMetric.table_id.in_(
             select(MetaTable.id).where(MetaTable.datasource_id == datasource_id)))
     metrics = (await session.execute(metrics_q)).scalars().all()
-    dims = (await session.execute(dims_q)).scalars().all()
 
     # ---- 1. 重复/疑似重复指标（同名或别名交叉） ----
     #    seen 记「名字 → 第一个占用者」：跨表同名指标会自动带上表后缀，

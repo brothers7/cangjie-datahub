@@ -20,6 +20,12 @@ const EDGE_STYLE: Record<string, { color: string; dash: number[]; labelKey: stri
 
 interface P { x: number; y: number; vx: number; vy: number; node: KgNode; fixed?: boolean }
 
+/** 物理停机参数：alpha 下限 / 位移稳定阈值 / 连续稳定帧数 / 迭代上限（超出即暂停斥力计算） */
+const ALPHA_MIN = 0.008
+const STILL_EPS = 0.08
+const STILL_FRAMES = 45
+const MAX_ITERS = 900
+
 export function GraphCanvas({ graph, selectedId, onSelect, types }: {
   graph: { nodes: KgNode[]; edges: KgEdge[] }
   selectedId?: string | null
@@ -37,6 +43,9 @@ export function GraphCanvas({ graph, selectedId, onSelect, types }: {
     pan: null as { x: number; y: number; tx: number; ty: number } | null,
     alpha: 1,
     raf: 0,
+    iters: 0,   // 物理迭代计数（超过 MAX_ITERS 强制停机）
+    still: 0,   // 连续「位移均值低于阈值」的帧数
+    redraw: 0,  // 停机状态下待补的纯绘制帧数（hover/选中/缩放等视觉更新）
   })
 
   const visibleNodes = graph.nodes.filter((n) => types.has(n.type))
@@ -54,7 +63,11 @@ export function GraphCanvas({ graph, selectedId, onSelect, types }: {
   visibleEdgesRef.current = visibleEdges
   tRef.current = t
 
-  // 初始化/增量同步坐标
+  // 由主循环 effect 赋值：wake 重启物理模拟，requestDraw 仅补绘制帧（不激活物理）
+  const wakeRef = useRef<(alpha?: number) => void>(() => undefined)
+  const redrawRef = useRef<(frames?: number) => void>(() => undefined)
+
+  // 初始化/增量同步坐标；节点/边数据变化时重新激活物理模拟
   useEffect(() => {
     const pts = state.current.points
     const seen = new Set<string>()
@@ -71,8 +84,13 @@ export function GraphCanvas({ graph, selectedId, onSelect, types }: {
       }
     })
     for (const id of [...pts.keys()]) if (!seen.has(id)) pts.delete(id)
-    state.current.alpha = 1
+    wakeRef.current(1)
+    // visibleNodes 经 ref 读取，不放入依赖（放入会导致每帧重建同步 effect）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [graph, types])
+
+  // hover/选中/语言变化只影响视觉：停机状态下补几帧绘制即可，不重启物理
+  useEffect(() => { redrawRef.current(2) }, [hover, selectedId, t])
 
   // ---- 物理与绘制 ----
   useEffect(() => {
@@ -89,6 +107,8 @@ export function GraphCanvas({ graph, selectedId, onSelect, types }: {
       canvas.style.height = `${rect.height}px`
       const ctx = canvas.getContext('2d')
       ctx?.setTransform(dpr, 0, 0, dpr, 0, 0)
+      // 重设 canvas 尺寸会清空画布，停机状态下需补一帧绘制
+      redrawRef.current(1)
     }
     resize()
     const ro = new ResizeObserver(resize)
@@ -126,14 +146,23 @@ export function GraphCanvas({ graph, selectedId, onSelect, types }: {
         b.vx -= fx; b.vy -= fy
       }
       // 向心 + 阻尼
+      let moved = 0, cnt = 0
       for (const p of list) {
         if (p.fixed) { p.vx = 0; p.vy = 0; continue }
         p.vx -= p.x * 0.0009 * alpha
         p.vy -= p.y * 0.0009 * alpha
         p.vx *= 0.82; p.vy *= 0.82
+        const px = p.x, py = p.y
         p.x += Math.max(-22, Math.min(22, p.vx))
         p.y += Math.max(-22, Math.min(22, p.vy))
+        moved += Math.hypot(p.x - px, p.y - py)
+        cnt++
       }
+      // 稳定性检测：连续 STILL_FRAMES 帧位移均值低于阈值，或迭代超上限 → 清零 alpha 停机
+      const st = state.current
+      st.iters += 1
+      st.still = (cnt && moved / cnt < STILL_EPS) ? st.still + 1 : 0
+      if (st.still >= STILL_FRAMES || st.iters >= MAX_ITERS) st.alpha = 0
     }
 
     const draw = () => {
@@ -222,21 +251,47 @@ export function GraphCanvas({ graph, selectedId, onSelect, types }: {
     }
 
     const frame = () => {
-      if (state.current.alpha > 0.008) {
+      const st = state.current
+      if (st.alpha > ALPHA_MIN) {
         stepForce()
-        state.current.alpha *= 0.985
+        st.alpha *= 0.985
       }
       draw()
-      state.current.raf = requestAnimationFrame(frame)
+      // 停机：物理收敛（alpha 衰减/位移稳定/迭代超限）且无待补绘制帧时停掉 rAF，
+      // 静止后 CPU 接近 0；拖拽/hover/数据变化经 wake / requestDraw 重新激活
+      if (st.alpha > ALPHA_MIN || st.redraw > 0) {
+        if (st.redraw > 0) st.redraw -= 1
+        st.raf = requestAnimationFrame(frame)
+      } else {
+        st.raf = 0
+      }
     }
-    state.current.raf = requestAnimationFrame(frame)
+    const ensureRunning = () => {
+      if (!state.current.raf) state.current.raf = requestAnimationFrame(frame)
+    }
+    // wake：重新激活物理模拟（数据变化/拖拽起点）；requestDraw：仅补绘制帧（hover/选中/resize）
+    wakeRef.current = (alpha = 1) => {
+      const st = state.current
+      st.alpha = Math.max(st.alpha, alpha)
+      st.iters = 0
+      st.still = 0
+      ensureRunning()
+    }
+    redrawRef.current = (frames = 2) => {
+      state.current.redraw = Math.max(state.current.redraw, frames)
+      ensureRunning()
+    }
+    const st = state.current
+    st.raf = requestAnimationFrame(frame)
 
     return () => {
-      cancelAnimationFrame(state.current.raf)
+      cancelAnimationFrame(st.raf)
+      st.raf = 0
+      wakeRef.current = () => undefined
+      redrawRef.current = () => undefined
       ro.disconnect()
     }
     // 主循环只挂载一次；hover/selectedId/visibleEdges/t 均经 ref 读取
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // React 的 onWheel 会注册为 passive 监听，preventDefault 无效（页面会跟着滚动），
@@ -248,6 +303,7 @@ export function GraphCanvas({ graph, selectedId, onSelect, types }: {
       e.preventDefault()
       const st = state.current
       st.transform.k = Math.max(0.25, Math.min(3, st.transform.k * (e.deltaY < 0 ? 1.12 : 0.89)))
+      redrawRef.current(2) // 缩放只改视图变换，补绘制帧即可
     }
     canvas.addEventListener('wheel', onWheel, { passive: false })
     return () => canvas.removeEventListener('wheel', onWheel)
@@ -281,7 +337,7 @@ export function GraphCanvas({ graph, selectedId, onSelect, types }: {
       const w = toWorld(e.clientX, e.clientY)
       state.current.drag = { id: hit.node.id, dx: w.x - hit.x, dy: w.y - hit.y }
       hit.fixed = true
-      state.current.alpha = Math.max(state.current.alpha, 0.35)
+      wakeRef.current(0.35) // 拖拽起点：局部重新激活物理
     } else {
       state.current.pan = { x: e.clientX, y: e.clientY, tx: state.current.transform.x, ty: state.current.transform.y }
     }
@@ -295,12 +351,14 @@ export function GraphCanvas({ graph, selectedId, onSelect, types }: {
         const w = toWorld(e.clientX, e.clientY)
         p.x = w.x - st.drag.dx
         p.y = w.y - st.drag.dy
+        redrawRef.current(2) // 拖拽中持续补帧，物理已收敛时也能跟手
       }
       return
     }
     if (st.pan) {
       st.transform.x = st.pan.tx + (e.clientX - st.pan.x)
       st.transform.y = st.pan.ty + (e.clientY - st.pan.y)
+      redrawRef.current(2)
       return
     }
     const hit = pick(e.clientX, e.clientY)

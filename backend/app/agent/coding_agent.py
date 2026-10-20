@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.skills.etl import _extract_json, _strip_dangerous, columns_by_table, sqlglot_check
+from app.core.config import settings
 from app.db.models import DwStandard, EtlTask, MetaColumn, MetaTable
 from app.services import dw_standards
 from app.db.models.llm import LlmScene
@@ -28,7 +29,7 @@ from app.llm.types import ChatMessage
 
 logger = logging.getLogger(__name__)
 
-MAX_STEPS = 8
+MAX_STEPS = settings.agent_max_steps  # 代理循环步数上限（settings 可调）
 
 MODE_PROPOSE = "propose"    # 需求 → 结构化建模方案
 MODE_REVISE = "revise"      # 任务级对话式修订

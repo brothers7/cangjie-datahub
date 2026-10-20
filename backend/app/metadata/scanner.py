@@ -8,12 +8,12 @@ from __future__ import annotations
 import logging
 import time
 
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from app.connectors.base import TableMeta
 from app.connectors.registry import get_connector
 from app.core.config import settings
-from app.db.models import DataSource, MetaColumn, MetaTable, ScanJob, ScanJobStatus, ScanMode
+from app.db.models import DataSource, MetaTable, ScanJob, ScanJobStatus, ScanMode
 from app.db.models.base import utcnow
 from app.kg import builder as kg_builder
 from app.kg import classifier as clf
@@ -78,6 +78,11 @@ async def scan_datasource(session, ds: DataSource, mode: ScanMode,
                     session, ds.id, tm, classifications, stats_by_col)
                 meta_table.meta_hash = new_hash
                 meta_table.last_seen_at = utcnow()
+                # 补采「建表时间、存储格式」（源库事实，不受人工保护字段约束）。
+                # 老库缺这两列时由 bootstrap._migrate_columns 在启动时补加
+                # （meta_tables.create_time / meta_tables.storage_format），此处正常写即可
+                meta_table.create_time = tm.create_time
+                meta_table.storage_format = tm.storage_format
                 await kg_builder.build_kg(session, ds.id, meta_table, tm,
                                           classifications, stats_by_col, stats)
             except Exception as e:  # 单表失败不影响整体

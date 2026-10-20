@@ -8,17 +8,19 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import accessible_datasource_ids, get_current_user
 from app.core.errors import NotFoundError, PermissionDenied, ValidationError
 from app.db.models import (AuditLog, DataSource, EtlTask, EtlTaskSource, GovernanceRun,
                            MetaColumn, MetaTable, Role)
+from app.db.models.governance import ProbeRun
 from app.db.models.llm import LlmScene
 from app.db.session import get_db
 from app.llm.gateway import gateway
@@ -165,7 +167,9 @@ async def probe_quality(body: ProbeIn, db: AsyncSession = Depends(get_db),
 
     from app.connectors.registry import get_connector
     conn = get_connector(ds)
+    t0 = time.monotonic()
     stats = await conn.sample_column_stats(body.table, cols, sample_rows=2000)
+    duration_ms = int((time.monotonic() - t0) * 1000)
     if not stats:
         raise ValidationError("采样失败（数据源不可达或表不存在），请检查数据源连通性")
 
@@ -193,9 +197,57 @@ async def probe_quality(body: ProbeIn, db: AsyncSession = Depends(get_db),
                              "issue": f"字段 {c} 在采样中全部不重复（{non_null} 行）",
                              "suggestion": "若该字段应为维度（如渠道/状态），取值异常分散，"
                                            "请确认上游解析逻辑"})
+    # 探查留档（ProbeRun）+ 审计元数据
+    run = ProbeRun(user_id=user.id, username=user.username, datasource_id=ds.id,
+                   table_name=body.table, columns=cols,
+                   params={"sample_rows": 2000, "requested_columns": body.columns[:12]},
+                   stats=stats, findings=findings, duration_ms=duration_ms)
+    db.add(run)
+    await db.flush()
     db.add(AuditLog(user_id=user.id, username=user.username, action="governance.probe",
                     resource_type="meta_table", resource_id=str(mt.id),
-                    detail={"table": body.table, "columns": cols, "sample_rows": 2000}))
+                    detail={"table": body.table, "columns": cols, "sample_rows": 2000,
+                            "probe_run_id": str(run.id)}))
     await db.commit()
     return {"table": body.table, "columns": cols, "sample_rows": 2000,
-            "stats": stats, "findings": findings}
+            "stats": stats, "findings": findings, "probe_run_id": str(run.id)}
+
+
+# ---------- 质量探查留档 ----------
+
+def _probe_row(r: ProbeRun, with_detail: bool) -> dict:
+    out = {"id": str(r.id), "table": r.table_name, "columns": r.columns,
+           "username": r.username, "datasource_id": str(r.datasource_id or ""),
+           "duration_ms": r.duration_ms, "finding_count": len(r.findings or []),
+           "created_at": r.created_at.isoformat()}
+    if with_detail:
+        out["params"] = r.params or {}
+        out["stats"] = r.stats or {}
+        out["findings"] = r.findings or []
+    return out
+
+
+@router.get("/probes")
+async def list_probes(page: int = 1, page_size: int = 20,
+                      db: AsyncSession = Depends(get_db),
+                      user=Depends(get_current_user)):
+    """质量探查留档分页列表：普通用户仅见本人发起的，admin 全量。"""
+    page, page_size = max(page, 1), min(max(page_size, 1), 100)
+    q = select(ProbeRun).order_by(ProbeRun.created_at.desc())
+    if user.role != Role.ADMIN:
+        q = q.where(ProbeRun.user_id == user.id)
+    total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
+    rows = (await db.execute(q.offset((page - 1) * page_size).limit(page_size))).scalars().all()
+    return {"total": total, "page": page,
+            "rows": [_probe_row(r, with_detail=False) for r in rows]}
+
+
+@router.get("/probes/{probe_id}")
+async def get_probe(probe_id: str, db: AsyncSession = Depends(get_db),
+                    user=Depends(get_current_user)):
+    run = await db.get(ProbeRun, uuid.UUID(probe_id))
+    if run is None:
+        raise NotFoundError("探查记录不存在")
+    if user.role != Role.ADMIN and str(run.user_id) != str(user.id):
+        raise PermissionDenied("无权查看该探查记录")
+    return _probe_row(run, with_detail=True)

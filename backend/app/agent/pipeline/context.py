@@ -102,3 +102,9 @@ class PipelineContext:
     @property
     def duration_ms(self) -> int:
         return int((time.monotonic() - self.started_at) * 1000)
+
+
+def _uuid(s):
+    """宽容 UUID 转换：接受 str / UUID 两种入参。"""
+    import uuid as _u
+    return s if isinstance(s, _u.UUID) else _u.UUID(str(s))

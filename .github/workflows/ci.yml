@@ -20,12 +20,27 @@ jobs:
           cache: pip
           cache-dependency-path: backend/pyproject.toml
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev]" pytest-cov
       - name: Run tests
-        run: python -m pytest tests/ -q
+        run: python -m pytest tests/ -q --cov=app --cov-report=term-missing
+
+  ruff:
+    name: Ruff lint (non-blocking)
+    runs-on: ubuntu-latest
+    # 宽松起步：仅 E9/F（语法错误与明显逻辑错误），暂不阻塞合并
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install ruff
+        run: pip install ruff
+      - name: Ruff check
+        run: ruff check backend/app --select E9,F
 
   frontend:
-    name: Frontend (tsc + build)
+    name: Frontend (tsc + test + build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -41,5 +56,20 @@ jobs:
         run: npm ci
       - name: Type check
         run: npx tsc --noEmit
+      - name: Unit tests (vitest)
+        run: npm test
+      - name: ESLint (non-blocking)
+        run: npm run lint
+        continue-on-error: true
       - name: Build
         run: npm run build
+
+  docker:
+    name: Docker build (no push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image
+        run: docker build -f docker/backend.Dockerfile -t cangjie-datahub-backend:ci .
+      - name: Build frontend image
+        run: docker build -f docker/frontend.Dockerfile -t cangjie-datahub-frontend:ci .

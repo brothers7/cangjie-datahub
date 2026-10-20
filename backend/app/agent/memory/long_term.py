@@ -8,9 +8,9 @@ import logging
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
-from app.db.models import QueryRecord, UserMemoryProfile
+from app.db.models import UserMemoryProfile
 from app.llm.gateway import gateway
 
 logger = logging.getLogger(__name__)

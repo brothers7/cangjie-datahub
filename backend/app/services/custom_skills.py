@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 
 import yaml
 
+from app.core.config import settings
 from app.core.errors import ValidationError
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
 MAX_ZIP_BYTES = 1024 * 1024          # 1MB
 MAX_FILE_BYTES = 256 * 1024          # 单文件 256KB
 MAX_FILES = 20
-PYTHON_TIMEOUT_SEC = 30
+PYTHON_TIMEOUT_SEC = settings.skill_python_timeout_sec  # 沙箱执行超时（settings 可调）
 PYTHON_MEM_LIMIT = 256 * 1024 * 1024  # 256MB
 
 # Python 型静态黑名单（命中即拒绝上传）

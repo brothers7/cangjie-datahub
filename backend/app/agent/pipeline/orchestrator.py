@@ -16,12 +16,15 @@ from app.agent import router_agent
 from app.agent.memory import long_term, short_term
 from app.agent.nlu import entity_linker
 from app.agent.nlu.time_parser import MOM_WORDS, YOY_WORDS
-from app.agent.pipeline.context import PipelineContext
+from app.agent.pipeline.analysis import (_EmptyResult, _anomalies_text, _answer_prompt, _build_chart,
+                                         _compare_text, _data_snapshot, _daily_series, _dim_column,
+                                         _metric_columns, _metrics_info, _plain_summary,
+                                         _result_metric_cols, _time_span, _value_ranges)
+from app.agent.pipeline.context import PipelineContext, _uuid
+from app.agent.pipeline.finalize import _apply_masking, _cache_key, _finalize
 from app.agent.retrieval import tavily
-from app.agent.skills import compute, sql_gen
 from app.agent.skills.anomaly import detect_anomalies, find_missing_dates
-from app.agent.skills.chart import _resolve_metric_cols, build_chart_spec
-from app.agent.skills.compute import _num
+from app.agent.skills import compute, sql_gen
 from app.agent.skills.report import report_generate
 from app.agent.skills.sql_guard import guard_sql
 from app.agent.skills.validate import validate_result
@@ -29,8 +32,7 @@ from app.connectors.registry import get_connector
 from app.core.config import settings
 from app.core.errors import AppError, LLMError
 from app.db.models import (AuditLog, Conversation, CustomSkill, DataSource, DatasourcePermission,
-                           MaskingRule, Message, MetaColumn, MetaTable, QueryRecord, QueryStatus,
-                           Report, Role, SkillStatus, SkillType, User)
+                           MaskingRule, Message, MetaColumn, MetaTable, Role, SkillStatus, SkillType, User)
 from app.db.models.base import utcnow
 from app.db.session import get_session_factory
 from app.kg import service as kg_service
@@ -42,7 +44,6 @@ CONFIRM_THRESHOLD = 0.9
 SQL_FIX_MAX_ROUNDS = 2
 # 需要时间序列的意图：表路由时强制要求目标表带时间列
 TIME_SERIES_INTENTS = {"trend", "compare"}
-
 
 async def start_pipeline(*, user_id: str, username: str, conversation_id: str,
                          question: str, confirm: dict | None = None) -> tuple[PipelineContext, asyncio.Task]:
@@ -56,6 +57,7 @@ async def start_pipeline(*, user_id: str, username: str, conversation_id: str,
 
 
 # ============================ 主入口 ============================
+
 
 async def run_pipeline(*, user_id: str, username: str, conversation_id: str,
                        question: str, confirm: dict | None = None,
@@ -133,6 +135,7 @@ async def run_pipeline(*, user_id: str, username: str, conversation_id: str,
 
 
 # ============================ 步骤实现 ============================
+
 
 async def _pipeline_body(ctx: PipelineContext) -> None:
     # ---- 3. 问题改写（多轮指代消解） ----
@@ -359,14 +362,37 @@ async def _pipeline_body(ctx: PipelineContext) -> None:
 
 # ============================ 子过程 ============================
 
+# 查询缓存 singleflight：缓存 miss 后同 key 并发请求只执行首个，其余等待同一结果
+_INFLIGHT_QUERIES: dict[str, asyncio.Future] = {}
+
+
+async def _run_singleflight(key: str, factory):
+    """进程内 singleflight：同 key 的并发调用只由首个执行 factory，其余等待同一结果。
+
+    返回 (结果, 是否首个执行者)。异常会透传给所有等待者；无论成败都清理登记，
+    后续请求重新竞争（失败不缓存）。
+    """
+    loop = asyncio.get_running_loop()
+    fut = _INFLIGHT_QUERIES.get(key)
+    if fut is not None:
+        return await fut, False  # 跟随者：等待首个请求的结果
+    fut = loop.create_future()
+    _INFLIGHT_QUERIES[key] = fut
+    try:
+        result = await factory()
+        fut.set_result(result)
+        return result, True
+    except Exception as e:
+        fut.set_exception(e)
+        fut.exception()  # 标记已取回，避免无等待者时的 "never retrieved" 告警
+        raise
+    finally:
+        if _INFLIGHT_QUERIES.get(key) is fut:
+            _INFLIGHT_QUERIES.pop(key, None)
+
+
 class _ConfirmRequired(Exception):
     pass
-
-
-def _uuid(s):
-    """宽容 UUID 转换：接受 str / UUID 两种入参。"""
-    import uuid as _u
-    return s if isinstance(s, _u.UUID) else _u.UUID(str(s))
 
 
 async def _rewrite(ctx: PipelineContext) -> str:
@@ -478,7 +504,10 @@ async def _run_custom_skill(ctx: PipelineContext, skill_row, name: str) -> None:
                              resource_id=str(skill_row.id),
                              detail={"name": skill_row.name, "version": skill_row.version,
                                      "type": skill_row.skill_type.value, "ok": ok,
-                                     "error": err[:300], "duration_ms": ctx.duration_ms}))
+                                     "error": err[:300], "duration_ms": ctx.duration_ms,
+                                     # 输入/输出摘要：审计可回溯「问了什么、答了什么」
+                                     "question": (ctx.question or "")[:200],
+                                     "output": (ctx.answer_text or "")[:200]}))
         await session.commit()
     if ok:
         st.finish(f"{skill_row.name} v{skill_row.version}")
@@ -619,36 +648,44 @@ async def _generate_and_query(ctx: PipelineContext) -> None:
         ctx.emit_step(st_query)
         return
 
-    try:
-        qr = await connector.execute(ctx.guarded_sql)
-    except Exception as e:
-        err = f"{e.__class__.__name__}: {e}"
-        st_query.fail(err[:200])
+    async def _exec_with_repair():
+        """实际打数仓（首个请求执行；含一轮执行错误回喂修复）。"""
+        try:
+            qr = await connector.execute(ctx.guarded_sql)
+        except Exception as e:
+            err = f"{e.__class__.__name__}: {e}"
+            st_query.fail(err[:200])
+            ctx.emit_step(st_query)
+            # 执行错误回喂修复一轮
+            if "syntax" in err.lower() or "error" in err.lower():
+                try:
+                    fixed = await sql_gen.sql_fix(question=ctx.rewritten, kg_context=kg_ctx,
+                                                  dialect=dialect, bad_sql=ctx.guarded_sql, errors=err,
+                                                  override_config_id=ctx.llm_config_id)
+                    g2 = guard_sql(fixed, dialect, allowed_tables, settings.sql_max_rows,
+                            current_db=ctx.datasource.database_name if ctx.datasource else "")
+                    if g2.ok:
+                        qr2 = await connector.execute(g2.sql)
+                        ctx.guarded_sql = g2.sql
+                        ctx.emit("sql", {"sql": g2.sql, "tables": g2.tables, "dialect": dialect,
+                                         "guarded": True})
+                        st_query.status = "finished"
+                        st_query.finish(f"自动纠错后成功，{qr2.row_count} 行")
+                        ctx.emit_step(st_query)
+                        return qr2
+                except Exception as e2:
+                    raise AppError(f"数仓查询失败: {str(e2)[:200]}", code="QUERY_FAILED") from e2
+            raise AppError(f"数仓查询失败: {err[:200]}", code="QUERY_FAILED")
+        st_query.finish(f"{qr.row_count} 行 / {qr.duration_ms}ms")
         ctx.emit_step(st_query)
-        # 执行错误回喂修复一轮
-        if "syntax" in err.lower() or "error" in err.lower():
-            try:
-                fixed = await sql_gen.sql_fix(question=ctx.rewritten, kg_context=kg_ctx,
-                                              dialect=dialect, bad_sql=ctx.guarded_sql, errors=err,
-                                              override_config_id=ctx.llm_config_id)
-                g2 = guard_sql(fixed, dialect, allowed_tables, settings.sql_max_rows,
-                        current_db=ctx.datasource.database_name if ctx.datasource else "")
-                if g2.ok:
-                    qr = await connector.execute(g2.sql)
-                    ctx.guarded_sql = g2.sql
-                    ctx.emit("sql", {"sql": g2.sql, "tables": g2.tables, "dialect": dialect,
-                                     "guarded": True})
-                    st_query.status = "finished"
-                    st_query.finish(f"自动纠错后成功，{qr.row_count} 行")
-                    ctx.emit_step(st_query)
-                    ctx.query = qr
-                    return
-            except Exception as e2:
-                raise AppError(f"数仓查询失败: {str(e2)[:200]}", code="QUERY_FAILED") from e2
-        raise AppError(f"数仓查询失败: {err[:200]}", code="QUERY_FAILED")
+        return qr
+
+    # singleflight：缓存 miss 后同 key 的并发请求只由首个打数仓，其余等待同一结果
+    qr, led = await _run_singleflight(key, _exec_with_repair)
     ctx.query = qr
-    st_query.finish(f"{qr.row_count} 行 / {qr.duration_ms}ms")
-    ctx.emit_step(st_query)
+    if not led:
+        st_query.finish(f"并发合并（复用同 key 执行结果），{qr.row_count} 行")
+        ctx.emit_step(st_query)
 
 
 def _time_expr(ctx: PipelineContext) -> str:
@@ -711,7 +748,6 @@ async def _validate_compute(ctx: PipelineContext) -> None:
                 # 宁可不对比，也不拿同一份数据算假变化率
                 ctx.compare = None
             else:
-                from app.connectors.base import QueryResult as QR
                 base_qr = await get_connector(ctx.datasource).execute(base_sql)
                 ctx.compare = {"rows": _apply_masking(ctx, base_qr.rows), "label": label}
         except Exception:
@@ -769,38 +805,6 @@ async def _validate_compute(ctx: PipelineContext) -> None:
     ctx.emit_step(st)
 
 
-def _daily_series(ctx: PipelineContext, metric_col: str) -> tuple[list[str], list]:
-    """按时间列汇总出单指标序列：同一天多行（维度拆解）先相加再排序。"""
-    order: list[str] = []
-    agg: dict[str, float] = {}
-    for r in ctx.cleaned_rows:
-        x = str(r.get(ctx.time_col))
-        if x not in agg:
-            order.append(x)
-            agg[x] = 0.0
-        v = _num(r.get(metric_col))
-        if v is not None:
-            agg[x] += v
-    order.sort()
-    return order, [agg[x] for x in order]
-
-
-def _build_chart(ctx: PipelineContext) -> object:
-    metric_cols = list(_metric_columns(ctx))
-    dim_cols = [c for c in (_dim_column(ctx, c) for c in ctx.linked.dimensions) if c]
-    unit = next((m.unit for m in ctx.metric_rows if m.unit), "")
-    title = ctx.rewritten[:60]
-    anomalies = [
-        {"x": a.get("x"), "value": a.get("value"), "direction": a.get("direction"),
-         "note": a.get("note"), "severity": a.get("severity")}
-        for a in (ctx.anomalies.get("points") or [])
-    ][:20]
-    return build_chart_spec(
-        title=title, intent=ctx.intent, columns=ctx.query.columns, rows=ctx.cleaned_rows,
-        metric_cols=metric_cols, dim_cols=dim_cols, time_col=ctx.time_col,
-        anomalies=anomalies, unit=unit, compare=ctx.compare)
-
-
 async def _answer_stream(ctx: PipelineContext) -> None:
     from app.db.models.llm import LlmScene
     from app.llm.gateway import gateway
@@ -835,276 +839,3 @@ _ANSWER_SYSTEM = """你是企业数据分析专家，基于给出的真实查询
 2. 简明扼要：3-6 句话；必要时用 1 个简短列表；不要重复表格全部数据。
 3. 若有对比/异常信息，点出关键变化与可能原因；禁止编造数据中没有的数字。
 4. 使用简体中文。"""
-
-
-def _answer_prompt(ctx: PipelineContext) -> str:
-    parts = [f"<问题>{ctx.rewritten}</问题>",
-             f"<指标口径>{_metrics_info(ctx)}</指标口径>",
-             f"<查询结果>{_data_snapshot(ctx)}</查询结果>"]
-    if ctx.compare:
-        parts.append(f"<对比信息>{_compare_text(ctx)}</对比信息>")
-    if ctx.anomalies:
-        parts.append(f"<异常检测>{_anomalies_text(ctx)}</异常检测>")
-    if ctx.validation.get("warnings"):
-        parts.append(f"<数据提示>{'；'.join(ctx.validation['warnings'])}</数据提示>")
-    parts.append("请给出分析回答：")
-    return "\n\n".join(parts)
-
-
-def _metrics_info(ctx: PipelineContext) -> str:
-    lines = []
-    cols = _metric_columns(ctx)
-    for m in ctx.metric_rows:
-        col = next((name for name, mm in cols.items() if mm.id == m.id), None) or m.name
-        lines.append(f"- {m.name}（{col}）: {m.business_def or '口径见图谱'}"
-                     + (f"，聚合 {m.agg_function}" if m.agg_function else "")
-                     + (f"，单位 {m.unit}" if m.unit else ""))
-    return "\n".join(lines)
-
-
-def _metric_columns(ctx: PipelineContext) -> dict:
-    """{物理列名: metric_row}（基于预取的 _column_names，带缓存）。"""
-    cached = getattr(ctx, "_metric_col_cache", None)
-    if cached is not None:
-        return cached
-    out: dict = {}
-    for m in ctx.metric_rows:
-        name = ctx._column_names.get(str(m.id))
-        if name:
-            out[name] = m
-    ctx._metric_col_cache = out  # type: ignore[attr-defined]
-    return out
-
-
-def _dim_column(ctx: PipelineContext, cand) -> str | None:
-    return ctx._dim_column_names.get(str(cand.id))
-
-
-def _result_metric_cols(ctx: PipelineContext, rows: list[dict]) -> list[str]:
-    """结果集里真正承载指标的列名。
-
-    LLM 常给聚合列起别名（`SUM(f.gmv) AS m`），KG 里的物理列名对不上结果列，
-    按物理列名取值会全部拿到 None —— 同比/环比数值、值域校验、回答里的统计
-    摘要都会静默失效（图表那边另有 _resolve_metric_cols 兜底，这里复用同一判据）。
-    """
-    metric_cols = list(_metric_columns(ctx))
-    if not metric_cols or not rows:
-        return []
-    exclude = {c for c in (_dim_column(ctx, d) for d in ctx.dim_rows) if c}
-    if ctx.time_col:
-        exclude.add(ctx.time_col)
-    return _resolve_metric_cols(ctx.query.columns, rows, metric_cols, exclude)
-
-
-def _time_span(rows: list[dict], time_col: str) -> int:
-    """结果里出现的不同时间点个数（用来判断对比期窗口是否被数据保留期截断）。"""
-    if not time_col:
-        return 0
-    return len({str(r.get(time_col)) for r in rows if r.get(time_col) is not None})
-
-
-def _value_ranges(ctx: PipelineContext, rows: list[dict]) -> dict[str, list]:
-    """{结果列名: 值域}。仅在单指标场景下才按位置回退到别名列 ——
-    多指标时列名对不上就没法判断哪个值域属于哪列，猜错会报出假告警。"""
-    metric_cols = _metric_columns(ctx)
-    out = {c: m.value_range for c, m in metric_cols.items() if m.value_range}
-    if len(metric_cols) == 1 and len(out) == 1 and not (set(out) & set(ctx.query.columns or [])):
-        result_cols = _result_metric_cols(ctx, rows)
-        if len(result_cols) == 1:
-            out[result_cols[0]] = next(iter(out.values()))
-    return out
-
-
-class _EmptyResult(Exception):
-    pass
-
-
-def _data_snapshot(ctx: PipelineContext) -> str:
-    rows = ctx.cleaned_rows[:20]
-    cols = ctx.query.columns[:12]
-    head = " | ".join(cols)
-    lines = [head, "-" * min(80, len(head) * 2)]
-    for r in rows:
-        lines.append(" | ".join(str(r.get(c, ""))[:24] for c in cols))
-    metric_cols = _result_metric_cols(ctx, ctx.cleaned_rows) or list(_metric_columns(ctx))
-    stats = {mc: compute.series_stats([r.get(mc) for r in ctx.cleaned_rows]) for mc in metric_cols[:5]}
-    stat_lines = [f"{k}: 合计={v.get('sum')} 均值={v.get('mean')} 最大={v.get('max')} 最小={v.get('min')}"
-                  for k, v in stats.items() if v.get("count")]
-    total = f"\n共 {len(ctx.cleaned_rows)} 行（仅展示前 {len(rows)} 行）" if len(ctx.cleaned_rows) > len(rows) else ""
-    return "\n".join(lines) + total + ("\n统计：" + "；".join(stat_lines) if stat_lines else "")
-
-
-def _compare_text(ctx: PipelineContext) -> str:
-    if not ctx.compare:
-        return ""
-    comp = compute.compare_rows(ctx.cleaned_rows, ctx.compare.get("rows") or [],
-                                _result_metric_cols(ctx, ctx.cleaned_rows)
-                                or list(_metric_columns(ctx)))
-    return "；".join(f"{c.name}: {c.current} vs {c.previous}"
-                     + (f"（{('+' if (c.pct or 0) >= 0 else '')}{c.pct}%）" if c.pct is not None else "")
-                     for c in comp)
-
-
-def _anomalies_text(ctx: PipelineContext) -> str:
-    pts = ctx.anomalies.get("points") or []
-    if not pts and not ctx.anomalies.get("missing_dates"):
-        return ""
-    lines = [f"在 {p['x']} 出现{('上涨' if p['direction'] == 'up' else '下跌')}异常: {p['value']}（{p['note']}）"
-             for p in pts[:8]]
-    if ctx.anomalies.get("missing_dates"):
-        lines.append(f"日期缺失: {', '.join(ctx.anomalies['missing_dates'][:10])}")
-    return "\n".join(lines)
-
-
-def _plain_summary(ctx: PipelineContext) -> str:
-    stats = []
-    for mc in list(_metric_columns(ctx))[:3]:
-        st = compute.series_stats([r.get(mc) for r in ctx.cleaned_rows])
-        if st.get("count"):
-            stats.append(f"{mc} 合计 {st['sum']}")
-    return f"（LLM 服务暂不可用，原始数据摘要）共 {len(ctx.cleaned_rows)} 行；" + "；".join(stats)
-
-
-def _cache_key(ctx: PipelineContext) -> str:
-    """查询缓存键：数据源 + SQL + 脱敏规则签名。
-
-    缓存里存的是脱敏后的行数据；脱敏规则变更后签名变化，旧缓存自然不再命中，
-    避免按过期口径把旧数据发给用户。
-    """
-    from app.services import cache_service
-    rules = getattr(ctx, "_mask_rules", None) or []
-    sig = ";".join(f"{p}:{s}" for p, s in sorted(rules))
-    return cache_service.cache_key(str(ctx.datasource.id), ctx.guarded_sql + "#mask:" + sig)
-
-
-def _apply_masking(ctx: PipelineContext, rows: list[dict]) -> list[dict]:
-    """按脱敏规则（列名模式）处理结果行。"""
-    rules = getattr(ctx, "_mask_rules", None)
-    if not rules:
-        return rows
-    import fnmatch
-    import hashlib
-
-    def strategy_for(col: str) -> str | None:
-        for pattern, strategy in rules:
-            if fnmatch.fnmatch(col.lower(), pattern.lower()):
-                return strategy
-        return None
-
-    out = []
-    for r in rows:
-        r = dict(r)
-        for col in list(r.keys()):
-            strategy = strategy_for(col)
-            if strategy and r[col] is not None:
-                v = str(r[col])
-                if strategy == "mask_partial":
-                    r[col] = (v[:3] + "***" + v[-2:]) if len(v) > 6 else "***"
-                elif strategy == "mask_hash":
-                    r[col] = hashlib.sha256(v.encode()).hexdigest()[:12]
-                else:
-                    r[col] = None
-        out.append(r)
-    return out
-
-
-# ============================ 收尾 ============================
-
-async def _finalize(ctx: PipelineContext, *, success: bool, pending: bool = False) -> None:
-    from app.services import cache_service
-    async with get_session_factory()() as session:
-        payload: dict = {
-            "steps": [s.to_dict() for s in ctx.steps],
-            "intent": ctx.intent,
-            "rewritten": ctx.rewritten,
-            "matched_metrics": [{"id": c.id, "name": c.name} for c in (ctx.linked.metrics if ctx.linked else [])],
-            "dimensions": [{"id": c.id, "name": c.name} for c in (ctx.linked.dimensions if ctx.linked else [])],
-            "time_range": ctx.time_range.to_dict() if ctx.time_range else None,
-            "sql": ctx.guarded_sql,
-            "chart_spec": ctx.chart_spec,
-            "anomalies": ctx.anomalies,
-            "validation": ctx.validation,
-            "web_evidences": ctx.web_evidences,
-            "cache_hit": ctx.cache_hit,
-            "error": ctx.error,
-            "etl": ctx.etl_design,
-            "metric_cards": getattr(ctx, "metric_cards", None),
-        }
-        if pending:
-            payload["pending_confirm"] = ctx.pending_confirm
-        if ctx.report:
-            report_row = Report(user_id=_uuid(ctx.user_id),
-                                conversation_id=_uuid(ctx.conversation_id),
-                                title=ctx.report["title"],
-                                content_md=ctx.report["content_md"],
-                                sections=ctx.report["sections"])
-            session.add(report_row)
-            await session.flush()
-            payload["report"] = {"id": str(report_row.id), "title": ctx.report["title"]}
-            ctx.report_id = str(report_row.id)  # type: ignore[attr-defined]
-
-        session.add(Message(conversation_id=_uuid(ctx.conversation_id), role="assistant",
-                            content=ctx.answer_text or ctx.error or "", payload=payload))
-        conv = await session.get(Conversation, _uuid(ctx.conversation_id))
-        if conv:
-            conv.message_count += 1
-            conv.last_active_at = utcnow()
-            if ctx.linked and ctx.linked.metrics:
-                conv.short_term_state = short_term.merge_state(
-                    ctx.state,
-                    metric_names=[c.name for c in ctx.linked.metrics],
-                    dim_names=[c.name for c in ctx.linked.dimensions],
-                    time_range=ctx.time_range.to_dict() if ctx.time_range else None,
-                    last_sql=ctx.guarded_sql or None, question=ctx.question,
-                    datasource_id=str(ctx.datasource.id) if ctx.datasource else None)
-
-        # 查询记录（成功/空结果/被拦截）
-        if ctx.intent not in ("smalltalk", "") and ctx.linked is not None:
-            status = QueryStatus.SUCCESS
-            if pending:
-                status = QueryStatus.BLOCKED
-            elif not success:
-                status = QueryStatus.ERROR
-            elif ctx.validation.get("empty"):
-                status = QueryStatus.EMPTY
-            qr = QueryRecord(
-                user_id=_uuid(ctx.user_id), conversation_id=_uuid(ctx.conversation_id),
-                datasource_id=ctx.datasource.id if ctx.datasource else None,
-                question=ctx.question, rewritten_question=ctx.rewritten,
-                matched_metric_ids=[c.id for c in ctx.linked.metrics],
-                used_dimensions=[c.name for c in ctx.linked.dimensions],
-                time_range=ctx.time_range.to_dict() if ctx.time_range else {},
-                sql_text=ctx.guarded_sql,
-                # sql_hash 供夜间反思按「同类查询」聚合沉淀报表模板
-                sql_hash=(cache_service.cache_key(str(ctx.datasource.id), ctx.guarded_sql)
-                          if ctx.datasource and ctx.guarded_sql else ""),
-                status=status,
-                row_count=len(ctx.cleaned_rows), duration_ms=ctx.duration_ms,
-                cache_hit=ctx.cache_hit, error_brief=ctx.error[:500],
-                chart_type=(ctx.chart_spec or {}).get("type", ""))
-            session.add(qr)
-            await session.flush()
-            ctx.query_record_id = str(qr.id)
-
-        # 缓存写入 + 记忆回写
-        if success and ctx.query is not None and not ctx.cache_hit:
-            # 存脱敏后的行数据（cleaned_rows）：命中链路直接复用，不再经过执行器
-            key = _cache_key(ctx)
-            await cache_service.set_cache(
-                session, key,
-                {"columns": ctx.query.columns, "rows": ctx.cleaned_rows[:500],
-                 "row_count": ctx.query.row_count, "duration_ms": ctx.query.duration_ms},
-                ctx.chart_spec, ctx.answer_text)
-        await session.commit()
-
-    if success and ctx.linked and ctx.linked.metrics:
-        metric_names = {c.id: c.name for c in ctx.linked.metrics}
-        async with get_session_factory()() as session:
-            await long_term.update_profile_stats(
-                session, _uuid(ctx.user_id), [c.id for c in ctx.linked.metrics], metric_names,
-                [c.name for c in ctx.linked.dimensions])
-            await session.commit()
-        await long_term.remember_query(
-            ctx.user_id, ctx.rewritten or ctx.question,
-            [c.id for c in ctx.linked.metrics],
-            ctx.guarded_sql[:200])

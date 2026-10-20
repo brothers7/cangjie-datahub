@@ -1,6 +1,8 @@
 """各数据库类型的具体连接器与注册表。"""
 from __future__ import annotations
 
+import sqlalchemy as sa
+
 from app.connectors.base import Connector
 from app.core.errors import DatasourceError
 from app.db.models.datasource import DbType
@@ -17,6 +19,39 @@ def _require(module: str, hint: str) -> None:
         __import__(module)
     except ImportError as e:
         raise DatasourceError(f"缺少数据库驱动 {module}，请安装 {hint}") from e
+
+
+def _information_schema_create_time(connector: Connector, name: str):
+    """MySQL 协议系（MySQL/Doris/StarRocks）：information_schema.TABLES 的 CREATE_TIME。"""
+    try:
+        with connector.engine().connect() as conn:
+            return conn.execute(sa.text(
+                "SELECT CREATE_TIME FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t"), {"t": name}).scalar()
+    except Exception:  # 取不到留空，不阻塞扫描
+        return None
+
+
+# Hive InputFormat 类名 → 存储格式名
+_HIVE_INPUT_FORMATS = {
+    "org.apache.hadoop.mapred.TextInputFormat": "TextFile",
+    "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat": "Parquet",
+    "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat": "ORC",
+    "org.apache.hadoop.hive.ql.io.avro.AvroContainerInputFormat": "Avro",
+    "org.apache.hadoop.hive.ql.io.RCFileInputFormat": "RCFile",
+    "org.apache.hadoop.hive.ql.io.HiveSequenceFileInputFormat": "SequenceFile",
+}
+
+
+def _parse_hive_storage_format(rows) -> str | None:
+    """从 DESCRIBE FORMATTED 结果行解析存储格式（未知格式返回原始类名）。"""
+    for row in rows:
+        cells = [str(c).strip() for c in row if c is not None]
+        for i, cell in enumerate(cells):
+            if cell.rstrip(":").lower() in ("inputformat", "storage format") and i + 1 < len(cells):
+                raw = cells[i + 1]
+                return _HIVE_INPUT_FORMATS.get(raw) or raw or None
+    return None
 
 
 class MySQLConnector(Connector):
@@ -38,6 +73,10 @@ class MySQLConnector(Connector):
     def _timeout_statement(self) -> str | None:
         return f"SET SESSION max_execution_time={settings_query_timeout_ms()}"
 
+    def _table_storage_info(self, name: str, schema: str) -> tuple:
+        # MySQL 系无「存储格式」概念，仅补采建表时间
+        return _information_schema_create_time(self, name), None
+
 
 class PostgresConnector(Connector):
     db_type = DbType.POSTGRESQL
@@ -53,6 +92,20 @@ class PostgresConnector(Connector):
 
     def _timeout_statement(self) -> str | None:
         return f"SET SESSION statement_timeout = '{settings_query_timeout_ms()}ms'"
+
+    def _table_storage_info(self, name: str, schema: str) -> tuple:
+        # PG 系统目录无建表时间：best-effort 取堆文件 mtime（pg_stat_file 需权限，失败留空）
+        try:
+            with self.engine().connect() as conn:
+                ct = conn.execute(sa.text(
+                    "SELECT (pg_stat_file('base/' || d.oid || '/' || c.relfilenode)).modification "
+                    "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "CROSS JOIN (SELECT oid FROM pg_database WHERE datname = current_database()) d "
+                    "WHERE c.relname = :t AND n.nspname = :s AND c.relkind = 'r'"),
+                    {"t": name, "s": schema or "public"}).scalar()
+                return ct, None
+        except Exception:
+            return None, None
 
 
 class ClickHouseConnector(Connector):
@@ -103,6 +156,10 @@ class _MySQLProtocolConnector(Connector):
         # Doris / StarRocks 以秒为单位
         return f"SET SESSION query_timeout = {settings_query_timeout_ms() // 1000}"
 
+    def _table_storage_info(self, name: str, schema: str) -> tuple:
+        # Doris / StarRocks 兼容 information_schema（无 CREATE_TIME 时容错留空）
+        return _information_schema_create_time(self, name), None
+
 
 class DorisConnector(_MySQLProtocolConnector):
     db_type = DbType.DORIS
@@ -144,6 +201,16 @@ class _ThriftConnector(Connector):
 
     def _estimate_rows(self, name: str, schema: str) -> int | None:
         return None   # Hive/Spark 大表不做 COUNT(*)
+
+    def _table_storage_info(self, name: str, schema: str) -> tuple:
+        # DESCRIBE FORMATTED 解析存储格式（TextFile/Parquet/ORC 等）；建表时间无统一口径留空
+        try:
+            with self.engine().connect() as conn:
+                rows = conn.execute(
+                    sa.text(f"DESCRIBE FORMATTED {self._quote_ident(name)}")).fetchall()
+        except Exception:  # 取不到留空，不阻塞扫描
+            return None, None
+        return None, _parse_hive_storage_format(rows)
 
 
 class HiveConnector(_ThriftConnector):

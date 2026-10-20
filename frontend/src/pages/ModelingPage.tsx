@@ -39,7 +39,7 @@ export default function ModelingPage() {
       {tab === 'ai' && <AiModelingPanel onAccepted={() => setTab('tasks')} />}
       {tab === 'tasks' && <TasksPanel key={params.get('task') || ''} />}
       {tab === 'standards' && <StandardsPanel />}
-      {tab === 'overview' && <><OverviewPanel /><AdvicePanel /></>}
+      {tab === 'overview' && <><OverviewPanel /><AdvicePanel onOpenTask={openTask} /></>}
       {tab === 'meta' && <TaskMetaPanel onOpenTask={openTask} />}
       {tab === 'sched' && <SchedulerCenterPanel onOpenTask={openTask} />}
     </div>
@@ -105,15 +105,37 @@ function StatCard({ label, value, sub, warn }: { label: string; value: number; s
 
 /* ================= AI 建模建议 ================= */
 
-function AdvicePanel() {
+/** 规划建议 finding：后端并行新增 suggested_task 字段（可空），支持一键转任务草稿 */
+type AdviceFinding = ModelingAdvice['findings'][number] & {
+  suggested_task?: { name: string; layer: string; target_table: string; reason: string } | null
+}
+
+function AdvicePanel({ onOpenTask }: { onOpenTask: (id: string) => void }) {
   const { t } = useI18n()
   const [data, setData] = useState<ModelingAdvice | null>(null)
   const [busy, setBusy] = useState(false)
+  // 一键转任务草稿：按 finding 索引记录创建中状态
+  const [creating, setCreating] = useState(-1)
   const run = async () => {
     setBusy(true)
     try { setData(await api.modelingAdvice()) }
     catch (e) { toast.error((e as ApiError).message) }
     finally { setBusy(false) }
+  }
+  /** 把 finding 携带的 suggested_task 创建为任务草稿，成功后跳转到该任务编辑 */
+  const toTask = async (f: AdviceFinding, i: number) => {
+    const st = f.suggested_task
+    if (!st) return
+    setCreating(i)
+    try {
+      const row = await api.createEtlTask({
+        name: st.name, layer: st.layer, target_table: st.target_table,
+        source: 'ai', notes: st.reason,
+      })
+      toast.ok(t('modeling.taskDraftCreated'))
+      onOpenTask(row.id)
+    } catch (e) { toast.error((e as ApiError).message) }
+    finally { setCreating(-1) }
   }
   return (
     <div className="col" style={{ gap: 12 }}>
@@ -125,13 +147,28 @@ function AdvicePanel() {
           {t('modeling.adviceHint')}
         </span>
       </div>
-      {data?.findings.map((f, i) => (
-        <div key={i} className={`tag ${f.level === 'block' ? 'danger' : f.level === 'warn' ? 'warn' : f.level === 'ok' ? 'ok' : ''}`}
-          style={{ display: 'block', whiteSpace: 'normal', padding: '8px 12px' }}>
-          <b>{f.title}</b>
-          <div className="tiny" style={{ marginTop: 2 }}>{f.detail}</div>
-        </div>
-      ))}
+      {data?.findings.map((f, i) => {
+        const st = (f as AdviceFinding).suggested_task
+        return (
+          <div key={i} className={`tag ${f.level === 'block' ? 'danger' : f.level === 'warn' ? 'warn' : f.level === 'ok' ? 'ok' : ''}`}
+            style={{ display: 'block', whiteSpace: 'normal', padding: '8px 12px' }}>
+            <b>{f.title}</b>
+            <div className="tiny" style={{ marginTop: 2 }}>{f.detail}</div>
+            {st && (
+              <div className="row tiny" style={{ gap: 8, marginTop: 6 }}>
+                <button className="btn sm" disabled={creating === i}
+                  onClick={() => void toTask(f as AdviceFinding, i)}>
+                  {creating === i ? t('modeling.creatingTaskDraft') : `🛠 ${t('modeling.suggestedToTask')}`}
+                </button>
+                <span className="muted">
+                  {st.layer ? `${st.layer.toUpperCase()} · ` : ''}<code>{st.target_table}</code>
+                  {st.reason ? ` · ${st.reason}` : ''}
+                </span>
+              </div>
+            )}
+          </div>
+        )
+      })}
       {data?.report && (
         <div className="card"><div className="card-body">
           <div className="tiny dim mb8">{t('modeling.adviceReport')}</div>

@@ -9,7 +9,7 @@
 up: .env
 	docker compose up -d --build
 	@echo ""
-	@echo "前端:   http://localhost:$${FRONTEND_PORT:-8080}  (默认账号 admin / admin12345)"
+	@echo "前端:   http://localhost:$${FRONTEND_PORT:-8080}  (默认账号 admin，密码见 .env 的 DEFAULT_ADMIN_PASSWORD，请登录后尽快修改)"
 	@echo "后端:   http://localhost:$${BACKEND_PORT:-9000}/docs"
 
 down:

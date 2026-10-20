@@ -13,7 +13,7 @@ import re
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import (DwStandard, EdgeType, EtlTask, KgEdge, MaskingRule, MetaColumn,
+from app.db.models import (EdgeType, EtlTask, KgEdge, MaskingRule, MetaColumn,
                            MetaTable, TableLayer)
 from app.services import dw_standards
 
@@ -47,7 +47,6 @@ async def run_rule_engine(db: AsyncSession, ds_ids: list | None) -> list[dict]:
     if ds_ids is not None:
         tq = tq.where(MetaTable.datasource_id.in_(ds_ids))
     tables = list((await db.execute(tq)).scalars())
-    tname = {t.table_name: t for t in tables}
     layer_of = {(t.table_name or "").lower(): t.layer.value for t in tables}
 
     task_q = select(EtlTask)

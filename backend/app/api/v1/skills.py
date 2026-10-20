@@ -91,6 +91,49 @@ async def set_status(skill_id: str, body: dict, db: AsyncSession = Depends(get_d
     return _row(s)
 
 
+@router.post("/{skill_id}/rollback")
+async def rollback(skill_id: str, body: dict, db: AsyncSession = Depends(get_db),
+                   user=Depends(require_admin)):
+    """版本回滚：把同名的目标历史版本置为启用（同组其它版本停用），历史全量保留。
+
+    body 支持两种定位方式（二选一）：
+    - {"target_version": 1}     按版本号
+    - {"target_skill_id": "…"}  按历史版本行 id（也兼容 "skill_id" 键）
+    采用「置启用」而非「复制新版本」：语义更安全，不产生内容歧义的新行。
+    """
+    current = await db.get(CustomSkill, uuid.UUID(skill_id))
+    if current is None:
+        raise NotFoundError("Skill 不存在")
+    body = body or {}
+    target: CustomSkill | None = None
+    if body.get("target_version") is not None:
+        target = (await db.execute(select(CustomSkill).where(
+            CustomSkill.name == current.name,
+            CustomSkill.version == int(body["target_version"])))).scalar_one_or_none()
+    elif body.get("target_skill_id") or body.get("skill_id"):
+        tid = body.get("target_skill_id") or body.get("skill_id")
+        target = await db.get(CustomSkill, uuid.UUID(str(tid)))
+        if target is not None and target.name != current.name:
+            raise ValidationError("目标版本不属于该 Skill（同名版本组内才能回滚）")
+    else:
+        raise ValidationError("请提供 target_version 或 target_skill_id")
+    if target is None:
+        raise NotFoundError("目标历史版本不存在")
+
+    # 同组其它版本全部停用，目标版本启用
+    for other in (await db.execute(
+            select(CustomSkill).where(CustomSkill.name == current.name,
+                                      CustomSkill.id != target.id))).scalars():
+        other.status = SkillStatus.DISABLED
+    target.status = SkillStatus.ENABLED
+    db.add(AuditLog(user_id=user.id, username=user.username, action="skill.rollback",
+                    resource_type="custom_skill", resource_id=str(target.id),
+                    detail={"name": target.name, "from_version": current.version,
+                            "target_version": target.version}))
+    await db.commit()
+    return _row(target)
+
+
 @router.delete("/{skill_id}")
 async def delete_skill(skill_id: str, db: AsyncSession = Depends(get_db),
                        user=Depends(require_admin)):

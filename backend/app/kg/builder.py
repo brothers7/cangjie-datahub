@@ -11,7 +11,7 @@ from sqlalchemy import select
 from app.connectors.base import ColumnMeta, TableMeta
 from app.db.models import (DimensionType, EdgeType, EntityType, KgDimension, KgEdge, KgMetric,
                           MetaColumn, MetaTable, SemanticRole, SourceKind)
-from app.db.models.metadata import AggFunc, TableLayer
+from app.db.models.metadata import TableLayer
 from app.kg import classifier as clf
 from app.kg.merger import apply_auto_merge, is_fully_protected, is_tombstoned
 

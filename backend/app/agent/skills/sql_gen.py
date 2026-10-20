@@ -5,7 +5,6 @@ import re
 
 from app.agent.skills.base import skill
 from app.agent.skills.sql_guard import detect_injection
-from app.core.errors import LLMError
 from app.db.models.llm import LlmScene
 from app.llm.gateway import gateway
 from app.llm.types import ChatMessage

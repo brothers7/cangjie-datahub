@@ -1,0 +1,28 @@
+# 版本控制与本地工具
+.git
+.claude
+tools
+
+# 前端构建产物与依赖
+node_modules
+frontend/node_modules
+dist
+frontend/dist
+
+# 后端本地运行数据（SQLite 库、演示库等）
+backend/local
+
+# Python 缓存与虚拟环境
+__pycache__
+**/__pycache__
+.venv
+backend/.venv
+
+# 文档截图（不进镜像，减小构建上下文）
+docs/screenshots
+
+# 本地数据库文件
+*.db
+
+# 环境密钥文件，绝不进入构建上下文
+.env

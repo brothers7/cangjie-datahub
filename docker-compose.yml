@@ -17,7 +17,10 @@ services:
     restart: unless-stopped
 
   qdrant:
-    image: qdrant/qdrant:latest
+    # 固定 minor 版本，避免 :latest 静默升级引入不兼容。
+    # v1.19 为 2026-10 查证时的最新 stable minor（最新 release v1.19.2，
+    # 见 https://github.com/qdrant/qdrant/releases）。升级时改这里并回归验证。
+    image: qdrant/qdrant:v1.19.2
     container_name: da_qdrant
     volumes:
       - qdrant_data:/qdrant/storage
@@ -34,6 +37,7 @@ services:
       APP_DB_URL: postgresql+asyncpg://${POSTGRES_USER:-data_agent}:${POSTGRES_PASSWORD:-data_agent_pg_pw}@postgres:5432/${POSTGRES_DB:-data_agent}
       QDRANT_URL: http://qdrant:6333
       DEMO_DB_PATH: /app/demo_data/ecom_demo.db
+      TZ: ${APP_TZ:-Asia/Shanghai}
     ports:
       - "${BACKEND_PORT:-9000}:9000"
     volumes:
@@ -43,6 +47,14 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_started
+    healthcheck:
+      # readiness：探测 DB + Qdrant（Qdrant 不可达仅降级标注，不影响整体）
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/api/readyz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      # 首启 bootstrap（建表/管理员/演示库/首次扫描）耗时较长，给足宽限
+      start_period: 90s
     networks: [data_agent_net]
     restart: unless-stopped
 
@@ -52,9 +64,11 @@ services:
       dockerfile: docker/frontend.Dockerfile
     container_name: da_frontend
     ports:
-      - "${FRONTEND_PORT:-8080}:80"
+      # 非 root nginx 镜像监听容器内 8080
+      - "${FRONTEND_PORT:-8080}:8080"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     networks: [data_agent_net]
     restart: unless-stopped
 

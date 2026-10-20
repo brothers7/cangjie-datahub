@@ -28,6 +28,9 @@ class Conversation(UUIDMixin, TimestampMixin, Base):
     datasource_id: Mapped[uuid.UUID | None] = mapped_column(UUIDType(), index=True)
     # 会话级模型覆盖：用户在本会话选定的 LLM 配置；None = 跟随场景绑定/全局默认
     llm_config_id: Mapped[uuid.UUID | None] = mapped_column(UUIDType(), index=True)
+    # new_session 切换策略的配置快照：会话首次解析时锁定的 config_id，
+    # 之后默认/场景绑定变更不影响本会话（仅对 switch_policy=new_session 的配置生效）
+    llm_snapshot_config_id: Mapped[uuid.UUID | None] = mapped_column(UUIDType(), default=None)
     # 短时记忆：当前指标/维度/时间窗/上次SQL摘要/对比基准
     short_term_state: Mapped[dict] = mapped_column(JSONType, default=dict)
     status: Mapped[ConversationStatus] = mapped_column(

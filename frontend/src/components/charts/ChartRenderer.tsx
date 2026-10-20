@@ -12,7 +12,7 @@ const fmt = (v: number | null | undefined, unit = '') => {
   return unit ? `${s}${unit}` : s
 }
 
-function baseOption(spec: ChartSpec): EChartsOption {
+function baseOption(): EChartsOption {
   const c = themeColors()
   return {
     backgroundColor: 'transparent',
@@ -34,7 +34,7 @@ function buildOption(spec: ChartSpec): EChartsOption {
   const unit = spec.unit || ''
 
   if (spec.type === 'line') {
-    const base = baseOption(spec)
+    const base = baseOption()
     return {
       ...base,
       tooltip: { ...(base.tooltip as object), trigger: 'axis' },
@@ -80,7 +80,7 @@ function buildOption(spec: ChartSpec): EChartsOption {
   }
 
   if (spec.type === 'bar' || spec.type === 'hbar') {
-    const base = baseOption(spec)
+    const base = baseOption()
     const horizontal = spec.type === 'hbar'
     const cat = { type: 'category' as const, data: spec.x, axisLine: { lineStyle: { color: c.border } }, axisLabel: { color: c.dim, fontSize: 11 }, axisTick: { show: false } }
     const val = { type: 'value' as const, axisLabel: { color: c.mute, fontSize: 11, formatter: (v: number) => fmt(v) }, splitLine: { lineStyle: { color: c.border, type: 'dashed' as const } } }
@@ -137,6 +137,8 @@ function buildOption(spec: ChartSpec): EChartsOption {
 export function ChartRenderer({ spec }: { spec: ChartSpec }) {
   // 主题 CSS 变量随系统亮/暗切换：tick 变化时重建 option
   const themeTick = useThemeTick()
+  // themeTick 不直接参与计算，但主题变化时必须重建 option（buildOption 读 CSS 变量）
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const option = useMemo(() => buildOption(spec), [spec, themeTick])
   const unit = spec.unit || ''
   const c = themeColors()

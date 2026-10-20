@@ -28,7 +28,8 @@ TABLE_QA_SYSTEM = """你是企业数据仓库的数据目录专家，回答用�
 5. 使用建议可包括：分区裁剪、过滤条件、粒度注意事项、行数规模提示。
 6. 指标口径问答（「XX 口径是什么/怎么算」）：只能引用「命中指标（口径卡）」中的业务口径与计算公式原文；口径未登记时必须明说「该指标口径未登记，请到『知识图谱』页补充」，禁止编造。
 7. 指标查表引导（「XX 指标到哪张表查」）：按口径卡的「可查表」作答，多张表时优先推荐汇总层（ADS/DWS）并说明各表粒度差异；指标未命中时明说未在指标图谱中登记。
-8. 简明扼要，用简体中文，必要时用短列表。"""
+8. 血缘简答：只能引用「血缘候选」中列出的候选上游/下游表，且必须说明这些是「按命名推断，未经登记」的关系；没有候选时明说该表未登记血缘关系。
+9. 简明扼要，用简体中文，必要时用短列表。"""
 
 
 def _tokens(text: str) -> set[str]:
@@ -149,6 +150,39 @@ async def metric_cards(session, metrics: list[KgMetric]) -> list[dict]:
     return cards
 
 
+# 分层命名约定的上游层映射（ODS→DWD→DWS→ADS 单向流动）
+_LAYER_UPSTREAM = {"dwd": ["ods"], "dws": ["dwd", "ods"], "ads": ["dws", "dwd", "ods"]}
+
+
+def _domain_token(table_name: str) -> str:
+    """从分层表名取业务域词（第二段）：dws_trade_daily → trade。取不到返回空。"""
+    segs = (table_name or "").lower().split("_")
+    return segs[1] if len(segs) >= 2 and len(segs[1]) >= 2 else ""
+
+
+def _infer_lineage(hit: list[MetaTable], tables: list[MetaTable]) -> list[str]:
+    """血缘简答候选：对命中表按分层命名约定找同业务域的上游层表。
+
+    纯命名推断（业务域取表名第二段），未登记的推断关系，注入 prompt 时必带标注。
+    """
+    hit_ids = {str(t.id) for t in hit}
+    lines: list[str] = []
+    for t in hit:
+        ups = _LAYER_UPSTREAM.get(t.layer.value)
+        token = _domain_token(t.table_name)
+        if not ups or not token:
+            continue
+        cands = [o for o in tables
+                 if str(o.id) not in hit_ids
+                 and o.layer.value in ups
+                 and _domain_token(o.table_name) == token]
+        if cands:
+            lines.append(f"- {t.table_name}（{t.layer.value} 层）的候选上游："
+                         + "、".join(f"{c.table_name}（{c.layer.value} 层）" for c in cands[:6])
+                         + "（按命名推断，未经登记）")
+    return lines
+
+
 async def build_context(session, datasource_id, question: str) -> tuple[str, list[str], list[dict]]:
     """组装数据目录上下文文本。返回 (prompt 文本, 命中表名列表, 命中指标口径卡)。"""
     hit, tables = await match_tables(session, datasource_id, question)
@@ -249,6 +283,12 @@ async def build_context(session, datasource_id, question: str) -> tuple[str, lis
                 f"- {id_name.get(str(e.src_id), '?')}.{lk} = {id_name.get(str(e.dst_id), '?')}.{rk}"
                 f"（{(props.get('join_type') or 'left').upper()} JOIN"
                 + ("，推断" if props.get("inferred", True) else "，人工登记") + "）")
+
+    # 血缘候选：按分层命名约定推断同业务域上游层表（血缘简答，必带「推断」标注）
+    lineage = _infer_lineage(hit, tables)
+    if lineage:
+        parts.append("\n## 血缘候选（按命名推断，未经登记；回答血缘问题时必须说明是推断）")
+        parts.extend(lineage[:10])
 
     # 其它表清单（简版，供选表对比）
     rest = [t for t in tables if str(t.id) not in {str(h.id) for h in hit}]

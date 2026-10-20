@@ -42,7 +42,6 @@ class TimeRange:
     def prev_period(self) -> "TimeRange":
         """上一个等长周期（环比）。"""
         s = date.fromisoformat(self.start)
-        e = date.fromisoformat(self.end)
         n = self.days
         return TimeRange((s - timedelta(days=n)).isoformat(), (s - timedelta(days=1)).isoformat(),
                          f"上一周期({self.label})", self.grain)

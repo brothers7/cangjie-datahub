@@ -4,7 +4,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api, ApiError } from '@/api/client'
 import { SqlText } from '@/components/common/SqlText'
-import { Confirm } from '@/components/common/ui'
+import { Confirm, fmtTime, StatusTag } from '@/components/common/ui'
 import { useI18n } from '@/i18n'
 import { toast } from '@/stores/app'
 import type { EtlDesignResult } from '@/types'
@@ -45,6 +45,11 @@ export function EtlPanel({ design, conversationId, datasourceId }: {
   const [pushing, setPushing] = useState(false)
   const [pushMsg, setPushMsg] = useState('')
   const [confirmPush, setConfirmPush] = useState(false)
+  // 推送成功后回读执行状态：记录 Azkaban 上的 project/flow，供「查询执行状态」使用
+  const [pushedFlow, setPushedFlow] = useState<{ project: string; flow: string } | null>(null)
+  const [execBusy, setExecBusy] = useState(false)
+  const [execMsg, setExecMsg] = useState('')
+  const [execInfo, setExecInfo] = useState<{ status: string; endTime?: number; cron: string } | null>(null)
 
   const saveAsTask = async () => {
     try {
@@ -72,14 +77,42 @@ export function EtlPanel({ design, conversationId, datasourceId }: {
     try {
       const r = await api.pushEtlToAzkaban(design)
       setPushMsg(r.message)
-      if (r.ok) toast.ok(t('chat.pushed'))
-      else toast.warn(r.message)
+      if (r.ok) {
+        toast.ok(t('chat.pushed'))
+        // 记录推送目标，展示「查询执行状态」入口；同时清掉上一次的回读结果
+        if (r.project && r.flow) setPushedFlow({ project: r.project, flow: r.flow })
+        setExecInfo(null)
+        setExecMsg('')
+      } else {
+        toast.warn(r.message)
+      }
     } catch (e) {
       const msg = (e as ApiError).message
       setPushMsg(msg)
       toast.error(msg)
     } finally {
       setPushing(false)
+    }
+  }
+
+  // 回读 flow 执行状态：走现有 azkabanMetadata 只读接口，按 project/flow 定位最近一次执行
+  const loadExecStatus = async () => {
+    if (!pushedFlow) return
+    setExecBusy(true)
+    setExecMsg('')
+    setExecInfo(null)
+    try {
+      const meta = await api.azkabanMetadata()
+      if (!meta.configured) { setExecMsg(t('chat.azkabanNotConfigured')); return }
+      if (meta.error) { setExecMsg(t('chat.azkabanSyncFailed', { error: meta.error })); return }
+      const flow = meta.projects.find((p) => p.name === pushedFlow.project)
+        ?.flows.find((f) => f.flow === pushedFlow.flow)
+      if (!flow) { setExecMsg(t('chat.execNotFound')); return }
+      setExecInfo({ status: flow.last_status || '', endTime: flow.last_end_time, cron: flow.cron })
+    } catch (e) {
+      setExecMsg((e as ApiError).message)
+    } finally {
+      setExecBusy(false)
     }
   }
 
@@ -109,6 +142,36 @@ export function EtlPanel({ design, conversationId, datasourceId }: {
         </div>
         {design.schedule && <div className="tiny muted mt8">{t('chat.scheduleAdvice')}{design.schedule}</div>}
         {pushMsg && <div className="tiny muted mt8">{pushMsg}</div>}
+        {pushedFlow && (
+          <div className="row mt8" style={{ gap: 8, alignItems: 'center' }}>
+            <button className="btn ghost sm" disabled={execBusy} onClick={() => void loadExecStatus()}>
+              {execBusy ? t('chat.execLoading') : t('chat.queryExecStatus')}
+            </button>
+            <span className="tiny muted"><code>{pushedFlow.project}/{pushedFlow.flow}</code></span>
+          </div>
+        )}
+        {execMsg && <div className="tiny muted mt8">{execMsg}</div>}
+        {execInfo && pushedFlow && (
+          <div className="card mt8">
+            <div className="card-body">
+              <div className="tiny dim mb8">{t('chat.execStatusTitle')}</div>
+              <table className="tbl" style={{ fontSize: 12.5 }}>
+                <thead><tr><th>{t('chat.colExecFlow')}</th><th>{t('chat.colExecStatus')}</th><th>{t('chat.colExecEndTime')}</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td><code>{pushedFlow.flow}</code>{execInfo.cron && <span className="tag" style={{ marginLeft: 6 }}>{execInfo.cron}</span>}</td>
+                    <td>{execInfo.status
+                      ? <StatusTag
+                          value={execInfo.status === 'SUCCEEDED' ? 'success' : execInfo.status === 'FAILED' ? 'failed' : 'running'}
+                          label={execInfo.status} />
+                      : <span className="muted">{t('chat.execNone')}</span>}</td>
+                    <td className="muted">{execInfo.endTime ? fmtTime(new Date(execInfo.endTime).toISOString()) : '-'}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
         {confirmPush && (
           <Confirm
             title={t('chat.pushToAzkaban')}

@@ -37,13 +37,15 @@ dependencies = [
 mysql = ["pymysql>=1.1"]
 postgres = ["psycopg[binary]>=3.1"]
 clickhouse = ["clickhouse-connect>=0.7", "clickhouse-sqlalchemy>=0.3"]
-hive = ["PyHive[hive]>=0.7"]
-spark = ["PyHive[hive]>=0.7"]
+# 注：不用 PyHive[hive] extra——其 sasl 依赖在 Python 3.12 无法编译（longintrepr.h 已移除）；
+# 无 Kerberos/LDAP 认证的 HiveServer2 仅需 PyHive + thrift。启用 SASL 认证的集群需另行处理。
+hive = ["PyHive>=0.7", "thrift>=0.16"]
+spark = ["PyHive>=0.7", "thrift>=0.16"]
 doris = ["pymysql>=1.1"]
 starrocks = ["pymysql>=1.1"]
 all-db = [
     "pymysql>=1.1", "psycopg[binary]>=3.1",
-    "clickhouse-connect>=0.7", "clickhouse-sqlalchemy>=0.3", "PyHive[hive]>=0.7",
+    "clickhouse-connect>=0.7", "clickhouse-sqlalchemy>=0.3", "PyHive>=0.7", "thrift>=0.16",
 ]
 dev = [
     "pytest>=8.0",

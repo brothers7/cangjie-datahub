@@ -910,8 +910,9 @@ all-db = [
     { name = "clickhouse-connect" },
     { name = "clickhouse-sqlalchemy" },
     { name = "psycopg", extra = ["binary"] },
-    { name = "pyhive", extra = ["hive"] },
+    { name = "pyhive" },
     { name = "pymysql" },
+    { name = "thrift" },
 ]
 clickhouse = [
     { name = "clickhouse-connect" },
@@ -925,7 +926,8 @@ doris = [
     { name = "pymysql" },
 ]
 hive = [
-    { name = "pyhive", extra = ["hive"] },
+    { name = "pyhive" },
+    { name = "thrift" },
 ]
 mysql = [
     { name = "pymysql" },
@@ -934,7 +936,8 @@ postgres = [
     { name = "psycopg", extra = ["binary"] },
 ]
 spark = [
-    { name = "pyhive", extra = ["hive"] },
+    { name = "pyhive" },
+    { name = "thrift" },
 ]
 starrocks = [
     { name = "pymysql" },
@@ -966,9 +969,9 @@ requires-dist = [
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.1" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pydantic-settings", specifier = ">=2.3" },
-    { name = "pyhive", extras = ["hive"], marker = "extra == 'all-db'", specifier = ">=0.7" },
-    { name = "pyhive", extras = ["hive"], marker = "extra == 'hive'", specifier = ">=0.7" },
-    { name = "pyhive", extras = ["hive"], marker = "extra == 'spark'", specifier = ">=0.7" },
+    { name = "pyhive", marker = "extra == 'all-db'", specifier = ">=0.7" },
+    { name = "pyhive", marker = "extra == 'hive'", specifier = ">=0.7" },
+    { name = "pyhive", marker = "extra == 'spark'", specifier = ">=0.7" },
     { name = "pyjwt", specifier = ">=2.8" },
     { name = "pymysql", marker = "extra == 'all-db'", specifier = ">=1.1" },
     { name = "pymysql", marker = "extra == 'doris'", specifier = ">=1.1" },
@@ -981,6 +984,9 @@ requires-dist = [
     { name = "qdrant-client", specifier = ">=1.9" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.30" },
     { name = "sqlglot", specifier = ">=25.0" },
+    { name = "thrift", marker = "extra == 'all-db'", specifier = ">=0.16" },
+    { name = "thrift", marker = "extra == 'hive'", specifier = ">=0.16" },
+    { name = "thrift", marker = "extra == 'spark'", specifier = ">=0.16" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
 provides-extras = ["mysql", "postgres", "clickhouse", "hive", "spark", "doris", "starrocks", "all-db", "dev"]
@@ -1910,12 +1916,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pure-sasl"
-version = "0.6.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/83/b7/a0d688f86c869073cc28c0640899394a1cf68a6d87ee78a09565e9037da6/pure-sasl-0.6.2.tar.gz", hash = "sha256:53c1355f5da95e2b85b2cc9a6af435518edc20c81193faa0eea65fdc835138f4", size = 11617, upload-time = "2019-10-14T21:43:57.13Z" }
-
-[[package]]
 name = "pycparser"
 version = "3.11"
 source = { registry = "https://pypi.org/simple" }
@@ -2105,13 +2105,6 @@ dependencies = [
     { name = "python-dateutil" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/f6/ec/5c658b3a4d99a6d9145030cc8e003c3f7efc668d866e88544812ab0af310/PyHive-0.7.0.tar.gz", hash = "sha256:585beff9578a61b99aed47140fec97e26323e8c685a5b5d0c8550a8ebf8a24e0", size = 46479, upload-time = "2023-08-17T23:29:25.26Z" }
-
-[package.optional-dependencies]
-hive = [
-    { name = "sasl" },
-    { name = "thrift" },
-    { name = "thrift-sasl" },
-]
 
 [[package]]
 name = "pyjwt"
@@ -2311,15 +2304,6 @@ wheels = [
 ]
 
 [[package]]
-name = "sasl"
-version = "0.3.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "six" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/df/ae/d8dda9ef1636f548935c271910d3b35afbf1782df582fda88a13ea48de53/sasl-0.3.1.tar.gz", hash = "sha256:0695030b23faa65aab2b462ce6f067d61caeb406de22d1ca7f9253fd9ebe127e", size = 44677, upload-time = "2021-06-16T11:28:52.028Z" }
-
-[[package]]
 name = "six"
 version = "1.17.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2441,20 +2425,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/f7/b4/f1a89ddd900b901f25cd784f2ad696038920a0f97ab74136c78ebbd3a272/thrift-0.25.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:6b42e755f38a536abfb3691ecc2850cdb61fe60848dd1ef434da26ac6dc31547", size = 1555187, upload-time = "2026-09-30T21:55:47.405Z" },
     { url = "https://files.pythonhosted.org/packages/5a/b1/70e0b40452ba223500f725a7df649ecfe89c21ababfc7678791a8bbcbd5f/thrift-0.25.0-cp314-cp314-win_amd64.whl", hash = "sha256:779da544bd3ce68ebb17a21b01db638a8e6c5a65f878e54374c90278e64d98ae", size = 431093, upload-time = "2026-09-30T21:55:48.891Z" },
     { url = "https://files.pythonhosted.org/packages/a0/19/4afcc4f4bd7fd81a6dc10fb796f69709266e7db0b8bcaa64a840585486a1/thrift-0.25.0-cp314-cp314-win_arm64.whl", hash = "sha256:07aa3ccd64304f77b315e4087b7ebf8e537935c070612fc5ad12c8076085ef3a", size = 605619, upload-time = "2026-09-30T21:55:50.263Z" },
-]
-
-[[package]]
-name = "thrift-sasl"
-version = "0.4.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "pure-sasl" },
-    { name = "six" },
-    { name = "thrift" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/fa/fb/5d9ba73be60b32f6fda080a5556cff25e15daf33bafe043c226404b39b25/thrift_sasl-0.4.3.tar.gz", hash = "sha256:5bdd5b760d90a13d9b3abfce873db0425861aa8d6bf25912d3cc0467a4f773da", size = 3962, upload-time = "2021-05-26T12:40:20.875Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/c3/9e/636c24ce1c0d46ce3020c5836c5a375d8e862fa81a240e0e352cc991dcf8/thrift_sasl-0.4.3-py2.py3-none-any.whl", hash = "sha256:d24b49140115e6e2a96d08335cff225a27a28ea71866fb1b2bdb30ca5afca64e", size = 8304, upload-time = "2021-05-26T12:40:19.425Z" },
 ]
 
 [[package]]

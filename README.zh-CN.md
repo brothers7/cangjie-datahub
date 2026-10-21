@@ -207,6 +207,7 @@ CI 同时运行 ruff（宽松不阻塞）并在每个 PR 上构建前后端 Dock
 | [docs/configuration.md](docs/configuration.md) | 全部环境变量参考表 |
 | [docs/operations.md](docs/operations.md) | 日志、健康检查（`/api/healthz` `/api/readyz`）、常见故障、告警 webhook |
 | [docs/architecture.md](docs/architecture.md) | 后端分层、调度引擎时序、前端结构 |
+| [docs/implementation-details.md](docs/implementation-details.md) | 五大能力主线实现详解（LLM 网关/问数链路/建模代理/语义本体/安全体系） |
 
 ---
 

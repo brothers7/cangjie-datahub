@@ -208,6 +208,7 @@ CI also runs ruff (non-blocking) and builds both Docker images on every PR.
 | [docs/configuration.md](docs/configuration.md) | Full environment variable reference |
 | [docs/operations.md](docs/operations.md) | Logs, health checks (`/api/healthz` `/api/readyz`), troubleshooting, alert webhook |
 | [docs/architecture.md](docs/architecture.md) | Backend layering, scheduler timing, frontend structure |
+| [docs/implementation-details.md](docs/implementation-details.md) | Deep-dive: LLM gateway, query pipeline, modeling agent, semantic layer, security (中文) |
 
 ---
 
